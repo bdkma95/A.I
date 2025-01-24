@@ -48,14 +48,18 @@ def result(board, action):
     Returns the board that results from making move (i, j) on the board.
     """
     i, j = action
-    
-    # Check if the action is valid
+
+    # Check if the indices are within bounds
+    if not (0 <= i < 3 and 0 <= j < 3):
+        raise ValueError("Invalid action: Indices are out of bounds.")
+
+    # Check if the cell is already occupied
     if board[i][j] is not EMPTY:
         raise ValueError("Invalid action: Cell is already occupied.")
     
     # Create a deep copy of the board to avoid modifying the original
-    new_board = [row[:] for row in board]  # Shallow copy each row
-    new_board[i][j] = player(board)  # Place the current player's mark
+    new_board = [row[:] for row in board]
+    new_board[i][j] = player(board)
     
     return new_board
 
@@ -113,41 +117,48 @@ def utility(board):
         return 0  # Tie
 
 
+def max_value(board):
+    """
+    Compute the maximum utility value that can be achieved from the given board state.
+    """
+    # Check if the game is over
+    if terminal(board):
+        return utility(board), None
+
+    v = float('-inf')
+    best_action = None
+    for action in actions(board):
+        min_val = min_value(result(board, action))[0]  # Get only the score
+        if min_val > v:
+            v = min_val
+            best_action = action
+    return v, best_action
+
+
+def min_value(board):
+    """
+    Compute the minimum utility value that can be achieved from the given board state.
+    """
+    # Check if the game is over
+    if terminal(board):
+        return utility(board), None
+
+    v = float('inf')
+    best_action = None
+    for action in actions(board):
+        max_val = max_value(result(board, action))[0]  # Get only the score
+        if max_val < v:
+            v = max_val
+            best_action = action
+    return v, best_action
+
 def minimax(board):
     """
     Returns the optimal action for the current player on the board.
     """
-    # Check if the board is terminal
     if terminal(board):
-        return None
+        return None  # No moves available
 
-    # Define a helper function for maximizing player (X)
-    def max_value(board):
-        if terminal(board):
-            return utility(board)
-        v = -math.inf
-        best_action = None
-        for action in actions(board):
-            min_val = min_value(result(board, action))
-            if min_val > v:
-                v = min_val
-                best_action = action
-        return v, best_action
-
-    # Define a helper function for minimizing player (O)
-    def min_value(board):
-        if terminal(board):
-            return utility(board)
-        v = math.inf
-        best_action = None
-        for action in actions(board):
-            max_val = max_value(result(board, action))
-            if max_val < v:
-                v = max_val
-                best_action = action
-        return v, best_action
-
-    # Get the current player
     current_player = player(board)
 
     if current_player == X:
