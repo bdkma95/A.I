@@ -4,10 +4,21 @@ import psycopg2
 import boto3
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import classification_report
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 import os
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+import gym
+from stable_baselines3 import PPO
 
 # Constants
 FOOTBALL_DATA_API_KEY = "your_football_data_api_key"
@@ -169,3 +180,178 @@ if __name__ == '__main__':
     
     # Run Flask app with SocketIO
     socketio.run(app, debug=True)
+
+def calculate_pass_accuracy_under_pressure(data):
+    """
+    Calculate pass accuracy under pressure.
+    """
+    data['pass_accuracy_under_pressure'] = (
+        data['successful_passes_under_pressure'] / data['total_passes_under_pressure']
+    )
+    data['pass_accuracy_under_pressure'].fillna(0, inplace=True)  # Handle division by zero
+    return data
+
+def train_xg_model(shot_data):
+    """
+    Train a simple xG model using shot data.
+    """
+    # Features: distance_to_goal, angle, body_part (encoded), etc.
+    X = shot_data[['distance_to_goal', 'angle', 'body_part']]
+    y = shot_data['goal']  # 1 if goal, 0 otherwise
+    
+    # Encode categorical features
+    X = pd.get_dummies(X, columns=['body_part'], drop_first=True)
+    
+    # Train a logistic regression model
+    model = LogisticRegression()
+    model.fit(X, y)
+    
+    return model
+
+def calculate_xg(data, xg_model):
+    """
+    Calculate expected goals (xG) for each shot.
+    """
+    X = data[['distance_to_goal', 'angle', 'body_part']]
+    X = pd.get_dummies(X, columns=['body_part'], drop_first=True)
+    data['xg'] = xg_model.predict_proba(X)[:, 1]  # Probability of being a goal
+    return data
+
+def calculate_defensive_score(data):
+    """
+    Calculate a defensive contribution score.
+    """
+    data['defensive_score'] = (
+        data['interceptions'] + data['clearances'] + data['blocks']
+    ) / data['minutes_played']
+    data['defensive_score'].fillna(0, inplace=True)  # Handle division by zero
+    return data
+
+def train_player_rating_model(data):
+    """
+    Train a regression model to predict player ratings.
+    """
+    # Features: goals, assists, pass_accuracy, defensive_score, etc.
+    features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
+    X = data[features]
+    y = data['player_rating']  # Target variable
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train a Random Forest regressor
+    model = RandomForestRegressor()
+    model.fit(X_train, y_train)
+    
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"Mean Squared Error: {mse:.2f}")
+    
+    return model
+
+def train_injury_risk_model(data):
+    """
+    Train a classification model to predict injury risks.
+    """
+    # Features: distance_covered, sprint_speed, heart_rate, etc.
+    features = ['distance_covered', 'sprint_speed', 'heart_rate', 'tackle_success_rate']
+    X = data[features]
+    y = data['injury_risk']  # Target variable (1 if injured, 0 otherwise)
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train a Random Forest classifier
+    model = RandomForestClassifier()
+    model.fit(X_train, y_train)
+    
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    print(classification_report(y_test, y_pred))
+    
+    return model
+
+def cluster_players(data):
+    """
+    Cluster players based on performance metrics.
+    """
+    # Features: goals, assists, pass_accuracy, defensive_score, etc.
+    features = ['goals', 'assists', 'pass_accuracy', 'defensive_score']
+    X = data[features]
+    
+    # Use KMeans clustering
+    kmeans = KMeans(n_clusters=3, random_state=42)
+    data['cluster'] = kmeans.fit_predict(X)
+    
+    # Visualize clusters
+    plt.scatter(X['goals'], X['assists'], c=data['cluster'], cmap='viridis')
+    plt.xlabel('Goals')
+    plt.ylabel('Assists')
+    plt.title('Player Clusters')
+    plt.show()
+    
+    return data
+
+def train_movement_model(movement_data):
+    """
+    Train a neural network to analyze player movement.
+    """
+    # Features: x, y coordinates, speed, acceleration, etc.
+    X = movement_data[['x', 'y', 'speed', 'acceleration']]
+    y = movement_data['outcome']  # Target variable (e.g., successful pass, shot, etc.)
+    
+    # Build a simple neural network
+    model = Sequential([
+        Dense(64, activation='relu', input_shape=(X.shape[1],)),
+        Dense(32, activation='relu'),
+        Dense(1, activation='sigmoid')  # Binary classification
+    ])
+    
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    
+    # Train the model
+    model.fit(X, y, epochs=10, batch_size=32, validation_split=0.2)
+    
+    return model
+
+def train_reinforcement_learning_agent():
+    """
+    Train a reinforcement learning agent to simulate player decision-making.
+    """
+    # Create a custom environment (e.g., football simulation)
+    env = gym.make('CustomFootballEnv-v0')
+    
+    # Use PPO algorithm
+    model = PPO('MlpPolicy', env, verbose=1)
+    model.learn(total_timesteps=10000)
+    
+    return model
+
+# Load data
+data = pd.read_csv("player_data.csv")
+
+# Feature Engineering
+data = calculate_pass_accuracy_under_pressure(data)
+data = calculate_defensive_score(data)
+
+# Train xG model
+shot_data = pd.read_csv("shot_data.csv")
+xg_model = train_xg_model(shot_data)
+data = calculate_xg(data, xg_model)
+
+# Train Player Rating Model
+player_rating_model = train_player_rating_model(data)
+
+# Train Injury Risk Model
+injury_risk_model = train_injury_risk_model(data)
+
+# Cluster Players
+data = cluster_players(data)
+
+# Train Movement Analysis Model
+movement_data = pd.read_csv("movement_data.csv")
+movement_model = train_movement_model(movement_data)
+
+# Train Reinforcement Learning Agent
+rl_model = train_reinforcement_learning_agent()
