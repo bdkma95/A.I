@@ -19,6 +19,9 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense
 import gym
 from stable_baselines3 import PPO
+import joblib
+import streamlit as st
+import plotly.express as px
 
 # Constants
 FOOTBALL_DATA_API_KEY = "your_football_data_api_key"
@@ -355,3 +358,227 @@ movement_model = train_movement_model(movement_data)
 
 # Train Reinforcement Learning Agent
 rl_model = train_reinforcement_learning_agent()
+
+# Load the trained model
+model = joblib.load("player_rating_model.pkl")
+
+app = Flask(__name__)
+
+@app.route('/predict-rating', methods=['POST'])
+def predict_rating():
+    """
+    API endpoint to predict player ratings.
+    """
+    data = request.json
+    input_data = pd.DataFrame([data])
+    
+    # Make predictions
+    prediction = model.predict(input_data)
+    
+    return jsonify({"predicted_rating": prediction[0]})
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+# Title
+st.title("Football Player Performance Dashboard")
+
+# Fetch data from the Flask/FastAPI API
+response = requests.post("http://localhost:5000/predict-rating", json={
+    "goals": 5,
+    "assists": 3,
+    "pass_accuracy": 85,
+    "defensive_score": 7.5,
+    "xg_contribution": 4.2
+})
+
+if response.status_code == 200:
+    prediction = response.json()["predicted_rating"]
+    st.write(f"**Predicted Player Rating:** {prediction:.2f}")
+else:
+    st.write("Failed to fetch prediction.")
+
+# Display raw data
+data = pd.read_csv("player_data.csv")
+st.write("### Player Data")
+st.write(data)
+
+def retrain_model():
+    """
+    Retrain the player rating model with new data.
+    """
+    # Load new data
+    new_data = pd.read_csv("new_player_data.csv")
+    
+    # Features and target
+    features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
+    X = new_data[features]
+    y = new_data['player_rating']
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train a new model
+    model = RandomForestRegressor()
+    model.fit(X_train, y_train)
+    
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"New Model Mean Squared Error: {mse:.2f}")
+    
+    # Save the updated model
+    joblib.dump(model, "player_rating_model.pkl")
+
+# Schedule retraining (e.g., using cron or a task scheduler)
+retrain_model()
+
+def monitor_model_performance():
+    """
+    Monitor the performance of the deployed model.
+    """
+    # Load test data
+    test_data = pd.read_csv("test_data.csv")
+    
+    # Features and target
+    features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
+    X = test_data[features]
+    y = test_data['player_rating']
+    
+    # Load the deployed model
+    model = joblib.load("player_rating_model.pkl")
+    
+    # Evaluate the model
+    y_pred = model.predict(X)
+    mse = mean_squared_error(y, y_pred)
+    print(f"Current Model Mean Squared Error: {mse:.2f}")
+    
+    # Set up alerts for significant changes
+    if mse > 5.0:  # Example threshold
+        print("Warning: Model performance has degraded significantly!")
+
+# Schedule monitoring (e.g., daily)
+monitor_model_performance()
+
+def identify_undervalued_players(performance_data, market_value_data):
+    """
+    Identify undervalued players based on performance metrics and market value.
+    """
+    # Merge performance and market value data
+    data = pd.merge(performance_data, market_value_data, on="player_id")
+    
+    # Normalize performance metrics
+    data['normalized_goals'] = (data['goals'] - data['goals'].min()) / (data['goals'].max() - data['goals'].min())
+    data['normalized_assists'] = (data['assists'] - data['assists'].min()) / (data['assists'].max() - data['assists'].min())
+    data['normalized_defensive_score'] = (data['defensive_score'] - data['defensive_score'].min()) / (data['defensive_score'].max() - data['defensive_score'].min())
+    
+    # Calculate value score
+    data['value_score'] = (
+        data['normalized_goals'] + data['normalized_assists'] + data['normalized_defensive_score']
+    ) / data['market_value']
+    
+    # Rank players by value score
+    data = data.sort_values(by="value_score", ascending=False)
+    
+    return data[['player_id', 'player_name', 'value_score', 'market_value', 'goals', 'assists', 'defensive_score']]
+
+def train_injury_risk_model(data):
+    """
+    Train a classification model to predict injury risks.
+    """
+    # Features: distance_covered, sprint_speed, heart_rate, minutes_played
+    features = ['distance_covered', 'sprint_speed', 'heart_rate', 'minutes_played']
+    X = data[features]
+    y = data['injury_risk']  # Target variable (1 if injured, 0 otherwise)
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train a Random Forest classifier
+    model = RandomForestClassifier()
+    model.fit(X_train, y_train)
+    
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    print(classification_report(y_test, y_pred))
+    
+    return model
+
+def predict_injury_risk(model, player_data):
+    """
+    Predict injury risk for a player.
+    """
+    prediction = model.predict(player_data)
+    return "High Risk" if prediction[0] == 1 else "Low Risk"
+
+def generate_positioning_heatmap(tracking_data):
+    """
+    Generate a heatmap for player positioning.
+    """
+    fig = px.density_heatmap(
+        tracking_data, x='x', y='y', nbinsx=20, nbinsy=20,
+        title="Player Positioning Heatmap"
+    )
+    fig.show()
+
+def analyze_movement_patterns(tracking_data):
+    """
+    Analyze movement patterns (e.g., passing lanes, defensive coverage).
+    """
+    # Example: Calculate average speed and distance covered
+    avg_speed = tracking_data['speed'].mean()
+    total_distance = tracking_data['distance_covered'].sum()
+    
+    print(f"Average Speed: {avg_speed:.2f} m/s")
+    print(f"Total Distance Covered: {total_distance:.2f} meters")
+
+def train_fantasy_points_model(data):
+    """
+    Train a regression model to predict fantasy points.
+    """
+    # Features: goals, assists, pass_accuracy, defensive_score, xg_contribution
+    features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
+    X = data[features]
+    y = data['fantasy_points']  # Target variable
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train a Random Forest regressor
+    model = RandomForestRegressor()
+    model.fit(X_train, y_train)
+    
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"Mean Squared Error: {mse:.2f}")
+    
+    return model
+
+def recommend_players(model, player_data):
+    """
+    Recommend players based on predicted fantasy points.
+    """
+    predictions = model.predict(player_data)
+    player_data['predicted_fantasy_points'] = predictions
+    return player_data.sort_values(by="predicted_fantasy_points", ascending=False)
+
+# Recommend players
+player_data = fantasy_data[['player_id', 'player_name', 'goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']]
+recommended_players = recommend_players(fantasy_model, player_data)
+print(recommended_players.head())
+
+# Player Scouting
+undervalued_players = identify_undervalued_players(performance_data, market_value_data)
+
+# Injury Prevention
+injury_model = train_injury_risk_model(biometric_data)
+risk_level = predict_injury_risk(injury_model, player_data)
+
+# Tactical Analysis
+generate_positioning_heatmap(tracking_data)
+analyze_movement_patterns(tracking_data)
+
+# Fantasy Football
+fantasy_model = train_fantasy_points_model(fantasy_data)
+recommended_players = recommend_players(fantasy_model, player_data)
