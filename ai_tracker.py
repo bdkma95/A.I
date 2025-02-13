@@ -1,8 +1,10 @@
 import requests
 import pandas as pd
 import psycopg2
+from psycopg2.extras import execute_batch
 import boto3
-from sklearn.model_selection import train_test_split
+import mlflow
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, mean_squared_error, classification_report
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
@@ -10,6 +12,9 @@ from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flasgger import Swagger
 import os
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -19,349 +24,215 @@ from stable_baselines3 import PPO
 import joblib
 import streamlit as st
 import plotly.express as px
+from cryptography.fernet import Fernet
+from functools import lru_cache
+from tenacity import retry, stop_after_attempt, wait_exponential
+from prometheus_client import start_http_server, Counter, Gauge
+from dotenv import load_dotenv
+from pydantic import BaseModel, ValidationError
+from typing import Optional, Dict, List
+import logging
+from psycopg2.pool import SimpleConnectionPool
+from celery import Celery
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("app.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+# Generate encryption key
+key = Fernet.generate_key()
+cipher_suite = Fernet(key)
+
+# Encrypt sensitive data
+encrypted_db_pw = cipher_suite.encrypt(os.getenv("DB_PASSWORD").encode())
+decrypted_pw = cipher_suite.decrypt(encrypted_db_pw).decode()
 
 # Constants
-FOOTBALL_DATA_API_KEY = "your_football_data_api_key"
-OPENWEATHERMAP_API_KEY = "your_openweathermap_api_key"
+FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
+OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
 POSTGRES_CONFIG = {
-    "dbname": "your_dbname",
-    "user": "your_username",
-    "password": "your_password",
-    "host": "your_host"
+    "dbname": os.getenv("POSTGRES_DB"),
+    "user": os.getenv("POSTGRES_USER"),
+    "password": decrypted_pw,
+    "host": os.getenv("POSTGRES_HOST"),
 }
 AWS_CONFIG = {
-    "aws_access_key_id": "your_access_key",
-    "aws_secret_access_key": "your_secret_key",
-    "bucket_name": "your_bucket_name"
+    "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
+    "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+    "bucket_name": os.getenv("AWS_BUCKET_NAME"),
 }
 
 # Initialize Flask app and SocketIO
 app = Flask(__name__)
 socketio = SocketIO(app)
+limiter = Limiter(app=app, key_func=get_remote_address, default_limits=["200 per day", "50 per hour"])
+Swagger(app)
+
+# Initialize Prometheus metrics
+API_REQUESTS = Counter('api_requests_total', 'Total API requests')
+MODEL_PREDICTIONS = Counter('model_predictions_total', 'Total predictions made')
+
+# Initialize Celery for async tasks
+celery = Celery('tasks', broker='redis://localhost:6379/0')
+
+# Initialize PostgreSQL connection pool
+postgres_pool = SimpleConnectionPool(1, 10, **POSTGRES_CONFIG)
+
+# ---------------------
+# Data Models
+# ---------------------
+
+class PlayerData(BaseModel):
+    player_id: int
+    goals: int
+    assists: int
+    minutes_played: int
 
 # ---------------------
 # Data Collection Layer
 # ---------------------
 
 class DataCollector:
-    def __init__(self, football_data_api_key, openweathermap_api_key):
+    def __init__(self, football_data_api_key: str, openweathermap_api_key: str):
         self.football_data_api_key = football_data_api_key
         self.openweathermap_api_key = openweathermap_api_key
 
-    def fetch_football_data(self):
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def fetch_football_data(self) -> pd.DataFrame:
         """Fetch match data from Football-Data.org API."""
         url = "https://api.football-data.org/v4/matches"
         headers = {"X-Auth-Token": self.football_data_api_key}
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            API_REQUESTS.inc()
             return pd.DataFrame(response.json()['matches'])
-        else:
-            raise Exception(f"Failed to fetch football data. Status Code: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API Error: {str(e)}")
+            raise
 
-    def fetch_weather_data(self, city="London"):
+    @lru_cache(maxsize=128)
+    def fetch_weather_data(self, city: str = "London") -> Dict[str, float]:
         """Fetch weather data from OpenWeatherMap API."""
         url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={self.openweathermap_api_key}"
-        response = requests.get(url)
-        
-        if response.status_code == 200:
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
             weather_data = response.json()
             return {
                 "temperature": weather_data['main']['temp'],
-                "humidity": weather_data['main']['humidity']
+                "humidity": weather_data['main']['humidity'],
             }
-        else:
-            raise Exception(f"Failed to fetch weather data. Status Code: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Weather API Error: {str(e)}")
+            raise
 
 # ---------------------
 # Data Storage Layer
 # ---------------------
 
 class DataStorage:
-    def __init__(self, postgres_config, aws_config):
+    def __init__(self, postgres_config: Dict, aws_config: Dict):
         self.postgres_config = postgres_config
         self.aws_config = aws_config
 
-    def save_to_postgres(self, data, table_name="players"):
-        """Save data to a PostgreSQL database."""
+    def save_to_postgres(self, data: pd.DataFrame, table_name: str) -> None:
+        """Save data to PostgreSQL using connection pooling."""
+        conn = postgres_pool.getconn()
+        cur = conn.cursor()
         try:
-            conn = psycopg2.connect(**self.postgres_config)
-            cur = conn.cursor()
-            
-            # Example: Insert data into a table
-            for _, row in data.iterrows():
-                cur.execute(
-                    f"INSERT INTO {table_name} (player_id, goals, assists) VALUES (%s, %s, %s)",
-                    (row['player_id'], row['goals'], row['assists'])
-                )
-            
+            columns = data.columns.tolist()
+            template = f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({','.join(['%s']*len(columns))})"
+            execute_batch(cur, template, data.values.tolist())
             conn.commit()
-            cur.close()
-            conn.close()
         except Exception as e:
-            print(f"Error saving to PostgreSQL: {e}")
+            logger.error(f"Database Error: {str(e)}")
+            conn.rollback()
+        finally:
+            cur.close()
+            postgres_pool.putconn(conn)
 
-    def upload_to_s3(self, file_name, bucket_name, object_name=None):
+    def upload_to_s3(self, file_name: str, bucket_name: str, object_name: Optional[str] = None) -> None:
         """Upload a file to AWS S3."""
         if object_name is None:
             object_name = os.path.basename(file_name)
-        
         s3 = boto3.client('s3', **self.aws_config)
         try:
             s3.upload_file(file_name, bucket_name, object_name)
-            print(f"File {file_name} uploaded to S3 bucket {bucket_name} as {object_name}.")
+            logger.info(f"File {file_name} uploaded to S3 bucket {bucket_name} as {object_name}.")
         except Exception as e:
-            print(f"Error uploading to S3: {e}")
+            logger.error(f"S3 Upload Error: {str(e)}")
 
 # ---------------------
 # Data Processing Layer
 # ---------------------
 
 class DataProcessor:
-    def process_data(self, data):
+    def process_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """Process and clean the data."""
         data['xg_contribution'] = data['expected_goals'] + data['expected_assists']
         data['pass_accuracy'] = data['successful_passes'] / data['total_passes']
-        data.fillna(0, inplace=True)  # Handle missing values
+        data.fillna(0, inplace=True)
         return data
 
-    def train_injury_prediction_model(self, data):
+    def train_injury_prediction_model(self, data: pd.DataFrame) -> RandomForestClassifier:
         """Train a Random Forest model to predict injury risk."""
         X = data[['distance_covered', 'sprint_speed', 'tackle_success_rate']]
         y = data['injury_risk']
-        
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        model = RandomForestClassifier()
-        model.fit(X_train, y_train)
-        
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        print(f"Model Accuracy: {accuracy:.2f}")
-        
-        return model
+        param_grid = {'n_estimators': [100, 200], 'max_depth': [None, 10]}
+        grid_search = GridSearchCV(RandomForestClassifier(), param_grid, cv=5)
+        grid_search.fit(X_train, y_train)
+        return grid_search.best_estimator_
 
-    def train_player_rating_model(self, data):
+    def train_player_rating_model(self, data: pd.DataFrame) -> RandomForestRegressor:
         """Train a regression model to predict player ratings."""
         features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
         X = data[features]
         y = data['player_rating']
-        
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
         model = RandomForestRegressor()
         model.fit(X_train, y_train)
-        
         y_pred = model.predict(X_test)
         mse = mean_squared_error(y_test, y_pred)
-        print(f"Mean Squared Error: {mse:.2f}")
-        
+        logger.info(f"Model MSE: {mse:.2f}")
         return model
-
-    def cluster_players(self, data):
-        """Cluster players based on performance metrics."""
-        features = ['goals', 'assists', 'pass_accuracy', 'defensive_score']
-        X = data[features]
-        
-        kmeans = KMeans(n_clusters=3, random_state=42)
-        data['cluster'] = kmeans.fit_predict(X)
-        
-        # Visualize clusters
-        plt.scatter(X['goals'], X['assists'], c=data['cluster'], cmap='viridis')
-        plt.xlabel('Goals')
-        plt.ylabel('Assists')
-        plt.title('Player Clusters')
-        plt.show()
-        
-        return data
-
-    def calculate_pass_accuracy_under_pressure(self, data):
-        """Calculate pass accuracy under pressure."""
-        data['pass_accuracy_under_pressure'] = (
-            data['successful_passes_under_pressure'] / data['total_passes_under_pressure']
-        )
-        data['pass_accuracy_under_pressure'].fillna(0, inplace=True)  # Handle division by zero
-        return data
-
-    def train_xg_model(self, shot_data):
-        """Train a simple xG model using shot data."""
-        X = shot_data[['distance_to_goal', 'angle', 'body_part']]
-        y = shot_data['goal']  # 1 if goal, 0 otherwise
-        
-        # Encode categorical features
-        X = pd.get_dummies(X, columns=['body_part'], drop_first=True)
-        
-        # Train a logistic regression model
-        model = LogisticRegression()
-        model.fit(X, y)
-        
-        return model
-
-    def calculate_xg(self, data, xg_model):
-        """Calculate expected goals (xG) for each shot."""
-        X = data[['distance_to_goal', 'angle', 'body_part']]
-        X = pd.get_dummies(X, columns=['body_part'], drop_first=True)
-        data['xg'] = xg_model.predict_proba(X)[:, 1]  # Probability of being a goal
-        return data
-
-    def calculate_defensive_score(self, data):
-        """Calculate a defensive contribution score."""
-        data['defensive_score'] = (
-            data['interceptions'] + data['clearances'] + data['blocks']
-        ) / data['minutes_played']
-        data['defensive_score'].fillna(0, inplace=True)  # Handle division by zero
-        return data
-
-    def train_movement_model(self, movement_data):
-        """Train a neural network to analyze player movement."""
-        X = movement_data[['x', 'y', 'speed', 'acceleration']]
-        y = movement_data['outcome']  # Target variable (e.g., successful pass, shot, etc.)
-        
-        # Build a simple neural network
-        model = Sequential([
-            Dense(64, activation='relu', input_shape=(X.shape[1],)),
-            Dense(32, activation='relu'),
-            Dense(1, activation='sigmoid')  # Binary classification
-        ])
-        
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        
-        # Train the model
-        model.fit(X, y, epochs=10, batch_size=32, validation_split=0.2)
-        
-        return model
-
-    def train_reinforcement_learning_agent(self):
-        """Train a reinforcement learning agent to simulate player decision-making."""
-        env = gym.make('CustomFootballEnv-v0')
-        model = PPO('MlpPolicy', env, verbose=1)
-        model.learn(total_timesteps=10000)
-        return model
-
-    def retrain_model(self, new_data_path="new_player_data.csv", model_path="player_rating_model.pkl"):
-        """Retrain the player rating model with new data."""
-        new_data = pd.read_csv(new_data_path)
-        features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
-        X = new_data[features]
-        y = new_data['player_rating']
-        
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        model = RandomForestRegressor()
-        model.fit(X_train, y_train)
-        
-        y_pred = model.predict(X_test)
-        mse = mean_squared_error(y_test, y_pred)
-        print(f"New Model Mean Squared Error: {mse:.2f}")
-        
-        joblib.dump(model, model_path)
-
-    def monitor_model_performance(self, test_data_path="test_data.csv", model_path="player_rating_model.pkl", threshold=5.0):
-        """Monitor the performance of the deployed model."""
-        test_data = pd.read_csv(test_data_path)
-        features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
-        X = test_data[features]
-        y = test_data['player_rating']
-        
-        model = joblib.load(model_path)
-        y_pred = model.predict(X)
-        mse = mean_squared_error(y, y_pred)
-        print(f"Current Model Mean Squared Error: {mse:.2f}")
-        
-        if mse > threshold:
-            print("Warning: Model performance has degraded significantly!")
-
-    def identify_undervalued_players(self, performance_data, market_value_data):
-        """Identify undervalued players based on performance metrics and market value."""
-        data = pd.merge(performance_data, market_value_data, on="player_id")
-        
-        # Normalize performance metrics
-        for col in ['goals', 'assists', 'defensive_score']:
-            data[f'normalized_{col}'] = (data[col] - data[col].min()) / (data[col].max() - data[col].min())
-        
-        # Calculate value score
-        data['value_score'] = (
-            data['normalized_goals'] + data['normalized_assists'] + data['normalized_defensive_score']
-        ) / data['market_value']
-        
-        # Rank players by value score
-        return data.sort_values(by="value_score", ascending=False)
-
-    def train_fantasy_points_model(self, data):
-        """Train a regression model to predict fantasy points."""
-        features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
-        X = data[features]
-        y = data['fantasy_points']
-        
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        model = RandomForestRegressor()
-        model.fit(X_train, y_train)
-        
-        y_pred = model.predict(X_test)
-        mse = mean_squared_error(y_test, y_pred)
-        print(f"Mean Squared Error: {mse:.2f}")
-        
-        return model
-
-    def recommend_players(self, model, player_data):
-        """Recommend players based on predicted fantasy points."""
-        predictions = model.predict(player_data)
-        player_data['predicted_fantasy_points'] = predictions
-        return player_data.sort_values(by="predicted_fantasy_points", ascending=False)
 
 # ---------------------
-# Analytics & Insights Layer
+# API Endpoints
 # ---------------------
 
 @app.route('/passing-suggestions', methods=['POST'])
+@limiter.limit("10 per minute")
 def passing_suggestions():
     """API endpoint for passing suggestions."""
-    data = request.json
-    insights = {"message": "Improve passing accuracy under pressure."}
-    return jsonify(insights)
+    try:
+        data = PlayerData(**request.json)
+        insights = {"message": "Improve passing accuracy under pressure."}
+        return jsonify(insights), 200
+    except ValidationError as e:
+        return jsonify({"error": str(e)}), 400
 
-def check_fatigue_risk(player_data):
-    """Check for fatigue risk based on distance covered."""
-    if player_data['distance_covered'] > 12000:  # Example threshold
-        return "High fatigue risk detected!"
-    return None
-
-@app.route('/')
-def index():
-    """Render the dashboard homepage."""
-    return render_template('index.html')
-
-@socketio.on('update')
-def handle_update(data):
-    """Handle real-time updates via WebSocket."""
-    socketio.emit('real_time_update', data)
-
-# ---------------------
-# Visualization Layer
-# ---------------------
-
-def generate_positioning_heatmap(tracking_data):
-    """Generate a heatmap for player positioning."""
-    fig = px.density_heatmap(
-        tracking_data, x='x', y='y', nbinsx=20, nbinsy=20,
-        title="Player Positioning Heatmap"
-    )
-    fig.show()
-
-def analyze_movement_patterns(tracking_data):
-    """Analyze movement patterns (e.g., passing lanes, defensive coverage)."""
-    avg_speed = tracking_data['speed'].mean()
-    total_distance = tracking_data['distance_covered'].sum()
-    
-    print(f"Average Speed: {avg_speed:.2f} m/s")
-    print(f"Total Distance Covered: {total_distance:.2f} meters")
+@app.route('/health')
+def health_check():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy"}), 200
 
 # ---------------------
 # Main Execution
 # ---------------------
 
 if __name__ == '__main__':
+    # Start Prometheus metrics server
+    start_http_server(8000)
+
     # Initialize components
     data_collector = DataCollector(FOOTBALL_DATA_API_KEY, OPENWEATHERMAP_API_KEY)
     data_storage = DataStorage(POSTGRES_CONFIG, AWS_CONFIG)
@@ -370,15 +241,15 @@ if __name__ == '__main__':
     # Fetch and process data
     matches_data = data_collector.fetch_football_data()
     processed_data = data_processor.process_data(matches_data)
-    
+
     # Save data to PostgreSQL and S3
-    data_storage.save_to_postgres(processed_data)
+    data_storage.save_to_postgres(processed_data, "matches")
     data_storage.upload_to_s3("processed_matches_data.csv", AWS_CONFIG['bucket_name'])
-    
+
     # Train machine learning models
     player_data = pd.read_csv("player_data.csv")
     injury_model = data_processor.train_injury_prediction_model(player_data)
     player_rating_model = data_processor.train_player_rating_model(player_data)
-    
+
     # Run Flask app with SocketIO
     socketio.run(app, debug=True)
