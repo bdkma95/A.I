@@ -1,7 +1,7 @@
 Football Analytics Platform
 Football Analytics
 
-The Football Analytics Platform is a comprehensive system designed to collect, process, and analyze football (soccer) data. It integrates machine learning models, real-time data processing, and visualization tools to provide insights into player performance, injury risk, and match outcomes.
+The Football Analytics Platform is a system designed to collect, process, and analyze football data. It integrates machine learning models, real-time data processing, and visualization tools to provide insights into player performance, injury risk, and match outcomes.
 
 Features
 Data Collection:
