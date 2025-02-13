@@ -34,6 +34,8 @@ from typing import Optional, Dict, List
 import logging
 from psycopg2.pool import SimpleConnectionPool
 from celery import Celery
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 load_dotenv()
@@ -84,6 +86,9 @@ celery = Celery('tasks', broker='redis://localhost:6379/0')
 
 # Initialize PostgreSQL connection pool
 postgres_pool = SimpleConnectionPool(1, 10, **POSTGRES_CONFIG)
+
+# Initialize ThreadPoolExecutor for concurrent tasks
+executor = ThreadPoolExecutor(max_workers=10)
 
 # ---------------------
 # Data Models
