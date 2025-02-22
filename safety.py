@@ -144,13 +144,3 @@ class SafetyAnalyzer:
     async def close(self):
         """Clean up resources"""
         await self.session.aclose()
-
-# Usage example
-async def main():
-    analyzer = SafetyAnalyzer()
-    try:
-        safety_data = await analyzer.get_safety_data(40.7128, -74.0060)
-        risk_assessment = analyzer.analyze_risk("This area feels dangerous at night")
-        print(risk_assessment)
-    finally:
-        await analyzer.close()
