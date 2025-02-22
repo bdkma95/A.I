@@ -172,17 +172,3 @@ class SocialConnector:
         """Load pre-trained clustering pipeline"""
         self.pipeline = joblib.load(path)
         logger.info("Model loaded successfully")
-
-# Usage example
-if __name__ == "__main__":
-    connector = SocialConnector()
-    interests = ["hiking photography", "museum visits", "beach sports"]
-    
-    result = connector.match_travelers(
-        interests=interests,
-        algorithm='kmeans',
-        n_clusters=2
-    )
-    
-    print(f"Cluster labels: {result['labels']}")
-    print(f"Top terms: {result['top_terms']}")
