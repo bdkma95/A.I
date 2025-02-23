@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Dict, Any
 from config import config
-from recommender import ItineraryRecommender
+from itinerary import ItineraryRecommender
 from safety import SafetyAnalyzer
 from translation import TranslationSystem, TranslationError
 from social import SocialConnector, ClusterResult
