@@ -77,19 +77,26 @@ class ModelTrainer:
     def train_rating_model(
         data: pd.DataFrame,
         param_dist: Optional[Dict[str, list]] = None,
-        n_iter: int = 50,
-        test_size: float = 0.2
-    ) -> Tuple[RandomForestRegressor, pd.DataFrame]:
-        """Train and validate player rating model with randomized parameter search.
-
+        n_iter: int = 100,
+        test_size: float = 0.2,
+        n_jobs: int = -1,
+        explain: bool = True
+    ) -> Tuple[RandomForestRegressor, pd.DataFrame, Optional[shap.Explanation]]:
+        """Train and validate player rating model with advanced features.
+        
         Args:
             data: DataFrame containing player performance metrics and ratings
             param_dist: Custom parameter distribution for RandomizedSearchCV
             n_iter: Number of parameter combinations to try
             test_size: Proportion of data to use for testing
-
+            n_jobs: Number of parallel jobs (-1 for all cores)
+            explain: Whether to generate SHAP explanations
+            
         Returns:
-            Tuple of (best model, validation metrics DataFrame)
+            Tuple containing:
+            - Best trained model
+            - Validation metrics DataFrame
+            - SHAP explanations (if explain=True)
         """
         features = ['goals', 'assists', 'pass_accuracy', 'defensive_score', 'xg_contribution']
         ModelTrainer._validate_data(data, features + ['player_rating'])
@@ -98,23 +105,27 @@ class ModelTrainer:
             'n_estimators': [100, 200, 300, 500],
             'max_depth': [None, 10, 20, 30, 50],
             'min_samples_split': [2, 5, 10],
-            'max_features': ['sqrt', 'log2', 0.8]
+            'max_features': ['sqrt', 'log2', 0.8],
+            'min_impurity_decrease': [0.0, 0.01, 0.1]
         }
         
         X = data[features]
         y = data['player_rating']
         
+        # Split data with stratification on binned ratings
+        y_bins = pd.qcut(y, q=5, labels=False)
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42
+            X, y, test_size=test_size, stratify=y_bins, random_state=42
         )
         
+        # Randomized parameter search with parallel execution
         search = RandomizedSearchCV(
             estimator=RandomForestRegressor(),
             param_distributions=param_dist or default_param_dist,
             n_iter=n_iter,
             cv=5,
             scoring='neg_mean_squared_error',
-            n_jobs=-1,
+            n_jobs=n_jobs,
             random_state=42
         )
         search.fit(X_train, y_train)
@@ -122,16 +133,30 @@ class ModelTrainer:
         best_model = search.best_estimator_
         y_pred = best_model.predict(X_test)
         
+        # Calculate metrics
         metrics = pd.DataFrame({
             'best_params': [search.best_params_],
             'mse': [mean_squared_error(y_test, y_pred)],
             'mae': [mean_absolute_error(y_test, y_pred)],
             'r2': [r2_score(y_test, y_pred)],
-            'n_iter': [n_iter]
+            'n_iter': [n_iter],
+            'features': [features]
         })
         
+        # Generate explanations if requested
+        shap_explanation = None
+        if explain:
+            shap_explanation = ModelTrainer.explain_model_shap(best_model, X_test)
+            
+            # Log feature impacts
+            mean_shap = np.abs(shap_explanation.values).mean(axis=0)
+            logger.info("Average SHAP impact:\n" + 
+                       pd.Series(mean_shap, index=features)
+                       .sort_values(ascending=False)
+                       .to_string())
+        
         logger.info(f"Rating model training complete. Best params: {search.best_params_}")
-        return best_model, metrics
+        return best_model, metrics, shap_explanation
 
     @staticmethod
     def cluster_players(
