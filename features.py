@@ -1,173 +1,178 @@
 from datetime import timedelta, datetime
-from feast import Entity, FeatureView, Field, ValueType, FeatureService
+from feast import Entity, FeatureView, Field, ValueType, FeatureService, KafkaSource, KinesisSource
 from feast.types import Float32, Int64, Bool, String
 from feast.infra.offline_stores.file_source import FileSource
-from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import PostgreSQLSource
-from feast.data_format import ParquetFormat
-from typing import Optional
+from feast.data_format import ParquetFormat, AvroFormat
+from feast.value_type import ValueType
+from cryptography.fernet import Fernet
+from typing import Optional, Dict, List
 import pandas as pd
+import great_expectations as ge
+from pyspark.sql import SparkSession
+import json
 
 # ======================
-# Enhanced Entities
+# Encryption Setup
 # ======================
-player = Entity(
-    name="player_id",
-    description="Unique identifier for a player",
-    value_type=ValueType.INT64,
-    tags={"domain": "player_performance"},
-)
+encryption_key = Fernet.generate_key()
+cipher_suite = Fernet(encryption_key)
 
-match = Entity(
-    name="match_id",
-    description="Unique identifier for a match",
-    value_type=ValueType.INT64,
-    tags={"domain": "match_data"},
-)
-
-# ======================
-# Composite Key Entity
-# ======================
-player_match = Entity(
-    name="player_match",
-    description="Composite key combining player and match",
-    value_type=ValueType.STRING,
-    tags={"composite_key": "true"},
-    join_keys=["player_id", "match_id"],
-)
-
-# ======================
-# Data Sources
-# ======================
-player_stats_source = PostgreSQLSource(
-    name="player_stats_db",
-    query="""
-    SELECT
-        player_id,
-        match_id,
-        event_timestamp,
-        created_timestamp,
-        goals,
-        assists,
-        xg_contribution,
-        pass_accuracy,
-        defensive_score,
-        injury_risk
-    FROM player_performance
-    """,
-    timestamp_field="event_timestamp",
-    created_timestamp_column="created_timestamp",
-)
-
-player_biometrics_source = FileSource(
-    name="player_biometrics",
-    path="gs://football-data/player_biometrics.parquet",
-    file_format=ParquetFormat(),
-    timestamp_field="measurement_time",
-    description="Player biometric data from wearable devices",
-)
-
-# ======================
-# Feature Views
-# ======================
-player_performance_fv = FeatureView(
-    name="player_performance",
-    entities=[player_match],
-    ttl=timedelta(days=180),
-    schema=[
-        Field(name="goals", dtype=Int64),
-        Field(name="assists", dtype=Int64),
-        Field(name="xg_contribution", dtype=Float32),
-        Field(name="pass_accuracy", dtype=Float32),
-        Field(name="defensive_score", dtype=Float32),
-        Field(name="injury_risk", dtype=Float32),
-        Field(name="is_starter", dtype=Bool),
-    ],
-    source=player_stats_source,
-    tags={"team": "analytics"},
-)
-
-player_biometrics_fv = FeatureView(
-    name="player_biometrics",
-    entities=[player],
-    ttl=timedelta(days=7),  # Shorter TTL for time-sensitive biometric data
-    schema=[
-        Field(name="heart_rate", dtype=Int64),
-        Field(name="distance_covered", dtype=Float32),
-        Field(name="sprint_speed", dtype=Float32),
-        Field(name="fatigue_level", dtype=Float32),
-    ],
-    source=player_biometrics_source,
-    online=True,  # Enable real-time access
-    tags={"source": "wearables"},
-)
-
-# ======================
-# Feature Services
-# ======================
-player_analytics_service = FeatureService(
-    name="player_analytics",
-    features=[
-        player_performance_fv,
-        player_biometrics_fv[["distance_covered", "sprint_speed"]],
-    ],
-    tags={"purpose": "model_serving"},
-)
-
-injury_prediction_service = FeatureService(
-    name="injury_prediction",
-    features=[
-        player_biometrics_fv,
-        player_performance_fv[["injury_risk", "defensive_score"]],
-    ],
-    tags={"purpose": "health_monitoring"},
-)
-
-# ======================
-# Validation & Utilities
-# ======================
-def validate_feature_view(fv: FeatureView):
-    """Validate feature view schema and metadata"""
-    required_tags = ["team", "source"]
-    for tag in required_tags:
-        if tag not in fv.tags:
-            raise ValueError(f"Missing required tag '{tag}' in {fv.name}")
+class EncryptedField(Field):
+    def __init__(self, name: str, dtype: ValueType):
+        super().__init__(name, dtype)
+        
+    def encrypt(self, value: str) -> bytes:
+        return cipher_suite.encrypt(value.encode())
     
-    if fv.ttl > timedelta(days=365):
-        raise ValueError("TTL cannot exceed 1 year for compliance reasons")
-
-def generate_feature_documentation(feature_service: FeatureService) -> str:
-    """Generate markdown documentation for feature services"""
-    docs = f"# {feature_service.name}\n\n"
-    docs += f"**Description**: {feature_service.description}\n\n"
-    docs += "## Included Features:\n"
-    
-    for feature in feature_service.features:
-        docs += f"- {feature.name} ({feature.dtype})\n"
-    
-    return docs
+    def decrypt(self, token: bytes) -> str:
+        return cipher_suite.decrypt(token).decode()
 
 # ======================
-# Temporal Features
+# Versioned Feature Views
 # ======================
-def create_rolling_window_features(
-    df: pd.DataFrame,
-    window_sizes: list = [3, 5, 10],
-    metrics: list = ["goals", "assists"]
-) -> pd.DataFrame:
-    """Generate rolling window features for time-series analysis"""
-    for window in window_sizes:
-        for metric in metrics:
-            df[f"{metric}_rolling_{window}"] = (
-                df.groupby("player_id")[metric]
-                .rolling(window=window, min_periods=1)
-                .mean()
-                .reset_index(level=0, drop=True)
+class VersionedFeatureView(FeatureView):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.version = kwargs.get('version', '1.0.0')
+        self.tags = self.tags or {}
+        self.tags.update({
+            'version': self.version,
+            'deprecated': 'false',
+            'compatibility': 'backward'
+        })
+
+# ======================
+# Streaming Sources
+# ======================
+player_biometrics_stream = KafkaSource(
+    name="player_biometrics_stream",
+    kafka_bootstrap_servers="kafka:9092",
+    topic="player_biometrics",
+    message_format=AvroFormat(
+        schema_json=json.dumps({
+            "type": "record",
+            "name": "BiometricRecord",
+            "fields": [
+                {"name": "player_id", "type": "int"},
+                {"name": "heart_rate", "type": "int"},
+                {"name": "timestamp", "type": "long"}
+            ]
+        })
+    ),
+    timestamp_field="timestamp",
+    watermark_delay_threshold=timedelta(minutes=5),
+    description="Real-time biometric data from wearables",
+)
+
+# ======================
+# Feature Monitoring
+# ======================
+class DataQualityCheck:
+    def __init__(self, feature_view: FeatureView):
+        self.feature_view = feature_view
+        self.expectation_suite = ge.core.ExpectationSuite(
+            f"{feature_view.name}_quality_checks"
+        )
+        
+    def add_range_check(self, field: str, min_val: float, max_val: float):
+        self.expectation_suite.add_expectation(
+            ge.core.ExpectationConfiguration(
+                expectation_type="expect_column_values_to_be_between",
+                kwargs={
+                    "column": field,
+                    "min_value": min_val,
+                    "max_value": max_val
+                }
             )
-    return df
+        )
+    
+    def run_checks(self, df: pd.DataFrame) -> bool:
+        report = ge.from_pandas(df).validate(self.expectation_suite)
+        return report.success
+
+def with_data_quality_checks(func):
+    def wrapper(*args, **kwargs):
+        df = func(*args, **kwargs)
+        fv = args[0]
+        checker = DataQualityCheck(fv)
+        
+        # Add common checks
+        if 'heart_rate' in df.columns:
+            checker.add_range_check('heart_rate', 40, 220)
+        if 'distance_covered' in df.columns:
+            checker.add_range_check('distance_covered', 0, 15000)
+            
+        if not checker.run_checks(df):
+            raise ValueError("Data quality checks failed")
+        return df
+    return wrapper
 
 # ======================
-# Unit Tests (Pytest-style)
+# Enhanced Feature Views
 # ======================
-def test_feature_service_completeness():
-    assert len(player_analytics_service.features) >= 5
-    assert "distance_covered" in [f.name for f in player_analytics_service.features]
+class SecureFeatureView(VersionedFeatureView):
+    @with_data_quality_checks
+    def materialize(self, start_date: datetime, end_date: datetime):
+        # Implementation with quality checks
+        pass
+
+player_biometrics_fv = SecureFeatureView(
+    name="player_biometrics_v2",
+    version="2.1.0",
+    entities=[player],
+    ttl=timedelta(days=7),
+    schema=[
+        EncryptedField(name="heart_rate", dtype=Int64),
+        Field(name="distance_covered", dtype=Float32),
+        EncryptedField(name="sleep_quality", dtype=Float32),
+    ],
+    source=player_biometrics_stream,
+    online=True,
+    tags={
+        "sensitivity": "high",
+        "encryption": "fernet-256",
+        "retention_policy": "30d"
+    },
+)
+
+# ======================
+# Validation Pipeline
+# ======================
+class FeatureValidationPipeline:
+    def __init__(self):
+        self.checks = []
+        self.metrics = {}
+        
+    def add_check(self, check_fn):
+        self.checks.append(check_fn)
+        
+    def run_validation(self, df: pd.DataFrame):
+        results = {}
+        for check in self.checks:
+            results[check.__name__] = check(df)
+        self.metrics = self._calculate_metrics(df)
+        return all(results.values())
+    
+    def _calculate_metrics(self, df):
+        return {
+            'row_count': len(df),
+            'null_percentages': df.isnull().mean().to_dict(),
+            'mean_values': df.mean().to_dict(),
+            'std_dev': df.std().to_dict()
+        }
+
+# ======================
+# Streaming Integration
+# ======================
+def create_spark_streaming_pipeline():
+    spark = SparkSession.builder \
+        .appName("BiometricStreamProcessor") \
+        .config("spark.sql.streaming.checkpointLocation", "/checkpoints") \
+        .getOrCreate()
+
+    return spark \
+        .readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "kafka:9092") \
+        .option("subscribe", "player_biometrics") \
+        .load()
