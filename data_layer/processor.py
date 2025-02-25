@@ -1,211 +1,244 @@
 import pandas as pd
 import numpy as np
+import mlflow
+import shap
 from typing import Optional, Dict, List, Tuple, Union
-from pydantic import BaseModel, ValidationError
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.feature_selection import SelectKBest, mutual_info_regression
-from feast import FeatureStore
-import great_expectations as ge
-import logging
-import json
+from pydantic import BaseModel, Field
 from datetime import datetime
-
-logger = logging.getLogger(__name__)
+import hashlib
+import json
+import pytest
+from packaging.version import Version
 
 # ---------------------
-# Schema Validation
+# Versioning & Lineage
 # ---------------------
-class FootballDataSchema(BaseModel):
-    class Config:
-        arbitrary_types_allowed = True
-
-    expected_goals: pd.Series
-    expected_assists: pd.Series
-    successful_passes: pd.Series
-    total_passes: pd.Series
-    match_date: pd.Series
+class FeatureVersion(BaseModel):
+    version: str = Field(..., regex=r'^\d+\.\d+\.\d+$')
+    schema: Dict[str, str]
+    description: str
+    created_at: datetime = datetime.now()
     
-    @classmethod
-    def validate_df(cls, df: pd.DataFrame) -> bool:
-        try:
-            cls(**df)
-            return True
-        except ValidationError as e:
-            logger.error(f"Schema validation failed: {str(e)}")
-            raise
+class DataLineage(BaseModel):
+    input_hash: str
+    processing_steps: List[str]
+    feature_versions: Dict[str, FeatureVersion]
+    parameters: Dict
+    parent_lineage: Optional[str] = None
 
 # ---------------------
-# Data Processor Class
+# Core Processor Class
 # ---------------------
-class DataProcessor:
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {
-            'feature_selection': {
-                'method': 'mutual_info',
-                'top_k': 10
-            },
-            'quality_metrics': {
-                'completeness_threshold': 0.95,
-                'value_ranges': {
-                    'pass_accuracy': (0.0, 1.0)
-                }
-            }
+class FootballDataProcessor:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.lineage: DataLineage = None
+        self.current_version = Version("1.2.0")
+        self._init_version_history()
+        
+    def _init_version_history(self):
+        self.version_history = {
+            "1.0.0": FeatureVersion(
+                version="1.0.0",
+                schema={"xg_contribution": "float", "pass_accuracy": "float"},
+                description="Initial feature set"
+            ),
+            "1.1.0": FeatureVersion(
+                version="1.1.0",
+                schema={"xg_contribution": "float", "pass_accuracy": "float", "defensive_impact": "float"},
+                description="Added defensive impact metric"
+            ),
+            "1.2.0": FeatureVersion(
+                version="1.2.0",
+                schema={**self.version_history["1.1.0"].schema, "physical_load": "float"},
+                description="Added physical load metric from wearable data"
+            )
         }
-        self.feature_store = FeatureStore(repo_path="feature_repo/")
-        self.quality_report: Dict = {}
-        self.feature_importances: pd.DataFrame = None
 
-    def process_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Main data processing pipeline"""
-        self._validate_input(data)
-        processed_data = self._core_processing(data.copy())
-        self._post_processing(processed_data)
-        return processed_data
+    def process_data(self, raw_data: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+        """Main processing pipeline with versioning and tracking"""
+        with mlflow.start_run():
+            try:
+                # Track lineage and version
+                self._create_lineage(raw_data)
+                
+                # Schema evolution handling
+                raw_data = self._handle_schema_evolution(raw_data)
+                
+                # Core processing
+                processed_data = self._apply_processing_steps(raw_data)
+                
+                # Explainability
+                explain_report = self._generate_explainability_report(processed_data)
+                
+                # MLflow tracking
+                self._log_mlflow_artifacts(processed_data, explain_report)
+                
+                return processed_data, explain_report
+                
+            except Exception as e:
+                mlflow.log_param("error", str(e))
+                raise
 
-    def _validate_input(self, data: pd.DataFrame) -> None:
-        """Validate input data structure and schema"""
-        FootballDataSchema.validate_df(data)
-        self._check_feature_store_schema(data)
+    def _create_lineage(self, data: pd.DataFrame) -> None:
+        """Create data lineage record"""
+        input_hash = hashlib.sha256(pd.util.hash_pandas_object(data).hexdigest())
+        self.lineage = DataLineage(
+            input_hash=input_hash,
+            processing_steps=[],
+            feature_versions={},
+            parameters=self.config
+        )
 
-    def _core_processing(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Execute core processing steps"""
-        data = self._handle_missing_values(data)
-        data = self._create_features(data)
-        data = self._select_features(data)
-        self._calculate_feature_importance(data)
+    def _handle_schema_evolution(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Apply schema migrations if needed"""
+        if 'wearable_id' in data.columns and self.current_version >= Version("1.2.0"):
+            data = self._add_physical_load(data)
         return data
 
-    def _post_processing(self, data: pd.DataFrame) -> None:
-        """Execute post-processing tasks"""
-        self._generate_quality_report(data)
-        self._save_to_feature_store(data)
+    def _apply_processing_steps(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Execute versioned processing steps"""
+        # Base features
+        data = self._create_base_features(data)
         
+        # Version-specific features
+        if self.current_version >= Version("1.1.0"):
+            data = self._create_defensive_metrics(data)
+            
+        if self.current_version >= Version("1.2.0"):
+            data = self._create_physical_metrics(data)
+            
+        return data
+
+    def _generate_explainability_report(self, data: pd.DataFrame) -> Dict:
+        """Generate SHAP explainability report"""
+        explainer = shap.Explainer(data.drop('target', axis=1))
+        shap_values = explainer(data)
+        
+        return {
+            "shap_summary": shap_values.summary_plot(),
+            "feature_importance": self._calculate_feature_importance(data),
+            "version": str(self.current_version)
+        }
+
+    def _log_mlflow_artifacts(self, data: pd.DataFrame, report: Dict) -> None:
+        """Log processing artifacts to MLflow"""
+        mlflow.log_params(self.config)
+        mlflow.log_metrics(report['feature_importance']['top_features'])
+        
+        # Log datasets
+        data.to_parquet("processed_data.parquet")
+        mlflow.log_artifact("processed_data.parquet")
+        
+        # Log explainability
+        with open("shap_report.html", "w") as f:
+            f.write(report['shap_summary'])
+        mlflow.log_artifact("shap_report.html")
+
     # ---------------------
     # Feature Engineering
     # ---------------------
-    def _create_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Create derived features"""
+    def _create_base_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Version 1.0 features"""
         data['xg_contribution'] = data['expected_goals'] + data['expected_assists']
         data['pass_accuracy'] = data['successful_passes'] / data['total_passes']
-        data = self._create_temporal_features(data)
+        self.lineage.processing_steps.append("base_features_v1")
         return data
 
-    def _create_temporal_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Create time-based features"""
-        data['match_week'] = data['match_date'].dt.isocalendar().week
-        data['month'] = data['match_date'].dt.month
+    def _create_defensive_metrics(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Version 1.1 features"""
+        data['defensive_impact'] = 0.7*data['tackles'] + 0.3*data['interceptions']
+        self.lineage.processing_steps.append("defensive_metrics_v1.1")
         return data
 
-    # ---------------------
-    # Feature Selection
-    # ---------------------
-    def _select_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Select top features based on config"""
-        method = self.config['feature_selection']['method']
-        k = self.config['feature_selection']['top_k']
+    def _create_physical_metrics(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Version 1.2 features"""
+        data['physical_load'] = data['distance_covered'] * data['sprint_intensity']
+        self.lineage.processing_steps.append("physical_metrics_v1.2")
+        return data
+
+# ---------------------
+# Unit Tests
+# ---------------------
+class TestFootballDataProcessor:
+    @pytest.fixture
+    def processor(self):
+        return FootballDataProcessor(config={"version": "1.2.0"})
+
+    @pytest.fixture
+    def legacy_data(self):
+        return pd.DataFrame({
+            'expected_goals': [1.2, 0.8],
+            'expected_assists': [0.4, 0.3],
+            'successful_passes': [45, 32],
+            'total_passes': [50, 35]
+        })
+
+    def test_backward_compatibility(self, processor, legacy_data):
+        processed, _ = processor.process_data(legacy_data)
+        assert 'xg_contribution' in processed.columns
+        assert 'defensive_impact' not in processed.columns
+
+    def test_schema_evolution(self, processor):
+        new_data = pd.DataFrame({
+            'expected_goals': [1.5],
+            'expected_assists': [0.6],
+            'successful_passes': [50],
+            'total_passes': [55],
+            'wearable_id': [123],
+            'distance_covered': [10500],
+            'sprint_intensity': [0.85]
+        })
+        processed, _ = processor.process_data(new_data)
+        assert 'physical_load' in processed.columns
+
+    def test_missing_data_handling(self, processor):
+        incomplete_data = pd.DataFrame({
+            'expected_goals': [None, 0.8],
+            'expected_assists': [0.4, None]
+        })
+        with pytest.raises(DataValidationError):
+            processor.process_data(incomplete_data)
+
+    def test_extreme_values(self, processor):
+        edge_data = pd.DataFrame({
+            'expected_goals': [1e6, -1],
+            'expected_assists': [None, 5000]
+        })
+        with pytest.raises(DataValidationError):
+            processor.process_data(edge_data)
+
+# ---------------------
+# Schema Evolution Strategies
+# ---------------------
+class SchemaManager:
+    def __init__(self):
+        self.migration_scripts = {
+            ("1.0.0", "1.1.0"): self._migrate_v1_to_v1_1,
+            ("1.1.0", "1.2.0"): self._migrate_v1_1_to_v1_2
+        }
+
+    def migrate(self, data: pd.DataFrame, from_version: str, to_version: str) -> pd.DataFrame:
+        current_version = Version(from_version)
+        target_version = Version(to_version)
         
-        if method == 'mutual_info':
-            return self._select_features_mutual_info(data, k)
-        elif method == 'importance':
-            return self._select_features_by_importance(data, k)
-        else:
-            logger.warning("No valid feature selection method specified")
-            return data
+        while current_version < target_version:
+            next_version = self._get_next_version(current_version)
+            migration_fn = self.migration_scripts.get((str(current_version), str(next_version)))
+            if migration_fn:
+                data = migration_fn(data)
+            current_version = next_version
+            
+        return data
 
-    def _select_features_mutual_info(self, data: pd.DataFrame, k: int) -> pd.DataFrame:
-        """Select features using mutual information"""
-        selector = SelectKBest(mutual_info_regression, k=k)
-        features = selector.fit_transform(data.drop('target', axis=1), data['target'])
-        selected_cols = data.columns[selector.get_support()]
-        return data[selected_cols]
+    def _migrate_v1_to_v1_1(self, data: pd.DataFrame) -> pd.DataFrame:
+        # Add defensive impact default value
+        if 'defensive_impact' not in data.columns:
+            data['defensive_impact'] = 0.0
+        return data
 
-    # ---------------------
-    # Feature Importance
-    # ---------------------
-    def _calculate_feature_importance(self, data: pd.DataFrame) -> None:
-        """Calculate and store feature importances"""
-        model = RandomForestRegressor()
-        model.fit(data.drop('target', axis=1), data['target'])
-        self.feature_importances = pd.DataFrame({
-            'feature': data.columns,
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-
-    def get_feature_importance(self) -> pd.DataFrame:
-        """Get calculated feature importances"""
-        if self.feature_importances is None:
-            raise ValueError("Feature importance not calculated. Run process_data first")
-        return self.feature_importances
-
-    # ---------------------
-    # Feature Store Integration
-    # ---------------------
-    def _save_to_feature_store(self, data: pd.DataFrame) -> None:
-        """Save processed features to Feast feature store"""
-        self.feature_store.write_features(
-            entity_rows=data.to_dict('records'),
-            features=[
-                "player_stats:xg_contribution",
-                "player_stats:pass_accuracy"
-            ]
-        )
-
-    def _check_feature_store_schema(self, data: pd.DataFrame) -> None:
-        """Validate against feature store schema"""
-        fs_schema = self.feature_store.get_feature_service("player_stats").features
-        missing_features = [f.name for f in fs_schema if f.name not in data.columns]
-        if missing_features:
-            logger.warning(f"Missing features required by feature store: {missing_features}")
-
-    # ---------------------
-    # Data Quality
-    # ---------------------
-    def _generate_quality_report(self, data: pd.DataFrame) -> None:
-        """Generate comprehensive data quality report"""
-        report = {
-            'timestamp': datetime.now().isoformat(),
-            'metrics': {
-                'completeness': self._calculate_completeness(data),
-                'value_ranges': self._check_value_ranges(data),
-                'outliers': self._detect_outliers(data)
-            },
-            'schema_validation': self._validate_output_schema(data)
-        }
-        self.quality_report = report
-        self._save_quality_report(report)
-
-    def _calculate_completeness(self, data: pd.DataFrame) -> Dict:
-        """Calculate completeness metrics"""
-        return data.notnull().mean().to_dict()
-
-    def _check_value_ranges(self, data: pd.DataFrame) -> Dict:
-        """Validate value ranges against config"""
-        results = {}
-        for col, (min_val, max_val) in self.config['quality_metrics']['value_ranges'].items():
-            if col in data.columns:
-                results[col] = {
-                    'pass_rate': data[col].between(min_val, max_val).mean(),
-                    'violations': data[~data[col].between(min_val, max_val)][col].count()
-                }
-        return results
-
-    def _save_quality_report(self, report: Dict) -> None:
-        """Persist quality report"""
-        with open(f"quality_reports/report_{datetime.now().date()}.json", "w") as f:
-            json.dump(report, f)
-
-    # ---------------------
-    # Type Hinting
-    # ---------------------
-    def get_quality_report(self) -> Dict[str, Union[Dict, str]]:
-        """Get generated quality report"""
-        return self.quality_report
-
-    def get_processed_schema(self) -> Dict[str, str]:
-        """Get schema of processed data"""
-        return {
-            'xg_contribution': 'float64',
-            'pass_accuracy': 'float64',
-            'match_week': 'int64',
-            'month': 'int64'
-        }
+    def _migrate_v1_1_to_v1_2(self, data: pd.DataFrame) -> pd.DataFrame:
+        # Calculate physical load if possible
+        if {'distance_covered', 'sprint_intensity'}.issubset(data.columns):
+            data['physical_load'] = data['distance_covered'] * data['sprint_intensity']
+        return data
