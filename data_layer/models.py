@@ -201,27 +201,3 @@ class PlayerManager:
             if goalkeeper:
                 return GoalkeeperData(**goalkeeper.__dict__)
             # Add other position queries
-
-# ----------------------
-# Usage Example
-# ----------------------
-async def main():
-    # Initialize player with real-time tracking
-    keeper = GoalkeeperData(
-        player_id=1,
-        team_id=101,
-        position=Position.GOALKEEPER
-    )
-    
-    # Start real-time updates
-    asyncio.create_task(keeper.real_time_updates("ws://tracking-feed.com"))
-    
-    # Periodically save state
-    while True:
-        PlayerManager.save_to_db(keeper)
-        keeper.plot_heatmap()
-        print(f"Injury Risk: {keeper.calculate_injury_risk():.2f}")
-        await asyncio.sleep(60)
-
-if __name__ == "__main__":
-    asyncio.run(main())
