@@ -1,243 +1,241 @@
 import psycopg2
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import boto3
 import os
-import pyarrow.parquet as pq
-import ssl
-from typing import Optional, Dict, Any, List, Union
-from psycopg2.pool import SimpleConnectionPool
-from psycopg2.extras import execute_batch
-from tenacity import retry, stop_after_attempt, wait_exponential
-from utils.logger import logger
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine.base import Engine
-import io
+import time
+import zlib
+from typing import Dict, List, Optional, Any, Union
+from prometheus_client import Gauge, Histogram, start_http_server
+from cryptography.fernet import Fernet
+from alembic import config as alembic_config, command
+from sqlalchemy import create_engine, event, text
+from threading import Lock
+from queue import Queue
+import json
 
-class DatabaseManager:
-    """Base class for database operations with common interface"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.config = self._configure_encryption(config)
-        self.engine = self.create_engine()
-        
-    def _configure_encryption(self, config: Dict) -> Dict:
-        """Configure encryption parameters for database connections"""
-        config.setdefault('sslmode', 'require')
-        config.setdefault('sslrootcert', os.getenv('DB_SSL_CA'))
-        return config
-        
-    def create_engine(self) -> Engine:
-        """Create SQLAlchemy engine for database backend"""
-        raise NotImplementedError
-        
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def execute_query(self, query: str, params: Dict = None) -> pd.DataFrame:
-        """Execute read query and return results as DataFrame"""
-        with self.engine.connect() as conn:
-            return pd.read_sql(text(query), conn, params=params)
-        
-    def bulk_delete(self, table: str, where_clause: str, params: List) -> int:
-        """Perform bulk delete operation with validation"""
-        if not where_clause:
-            raise ValueError("Where clause required for bulk delete")
-            
-        query = f"DELETE FROM {table} WHERE {where_clause}"
-        return self.execute_update(query, params)
-        
-    def execute_update(self, query: str, params: List = None) -> int:
-        """Execute update/delete query and return affected rows"""
-        with self.engine.begin() as conn:
-            result = conn.execute(text(query), params or {})
-            return result.rowcount
+# ======================
+# Metrics & Monitoring
+# ======================
+DB_CONNECTIONS = Gauge('db_connections', 'Current database connections', ['state'])
+QUERY_DURATION = Histogram('query_duration', 'Query execution time', ['operation'])
+POOL_WAIT_TIME = Histogram('pool_wait_time', 'Connection wait time')
 
-class PostgresManager(DatabaseManager):
-    """PostgreSQL implementation with connection pooling and health checks"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
-        self.pool = self._create_connection_pool()
-        self.connection_ages = {}
-        
-    def create_engine(self) -> Engine:
-        return create_engine(f"postgresql+psycopg2://{self.config['user']}:{self.config['password']}"
-                            f"@{self.config['host']}:{self.config['port']}/{self.config['database']}",
-                            pool_size=10, max_overflow=20)
+# ======================
+# Columnar Encryption
+# ======================
+class ColumnarEncryption:
+    def __init__(self, key_store: Dict[str, bytes]):
+        self.keys = key_store
+        self.column_crypto = {}
 
-    def _create_connection_pool(self) -> SimpleConnectionPool:
-        """Create connection pool with health checks"""
-        pool = SimpleConnectionPool(
-            minconn=1,
-            maxconn=10,
-            **self.config
+    def configure_encryption(self, column_map: Dict[str, str]):
+        """Map columns to encryption keys"""
+        self.column_crypto = {
+            col: self.keys[key_name] for col, key_name in column_map.items()
+        }
+
+    def get_encryption_config(self):
+        """Generate parquet encryption configuration"""
+        return pq.EncryptionConfiguration(
+            column_keys=self.column_crypto,
+            encryption_algorithm="AES_GCM_V1",
+            cache_lifetime=300
         )
-        self._test_pool_health(pool)
-        return pool
-        
-    def _test_pool_health(self, pool: SimpleConnectionPool) -> bool:
-        """Verify all connections in the pool are healthy"""
-        for _ in range(pool.minconn):
-            conn = pool.getconn()
-            if not self._is_connection_alive(conn):
-                conn.close()
-                pool.putconn(conn)
-        return True
-        
-    def _is_connection_alive(self, conn) -> bool:
-        """Check if connection is still valid"""
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                return cur.fetchone()[0] == 1
-        except psycopg2.InterfaceError:
-            return False
-            
-    def _recycle_connections(self) -> None:
-        """Recycle connections older than max age"""
-        max_age = timedelta(minutes=30)
-        now = datetime.now()
-        
-        for conn in list(self.connection_ages.keys()):
-            if now - self.connection_ages[conn] > max_age:
-                conn.close()
-                del self.connection_ages[conn]
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def save_data(self, data: pd.DataFrame, table: str, batch_size: int = 1000) -> None:
-        """Save DataFrame to PostgreSQL with connection recycling"""
-        self._recycle_connections()
-        columns = data.columns.tolist()
-        query = f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join(['%s']*len(columns))})"
-        
-        with self.engine.begin() as conn:
-            data.to_sql(table, conn, if_exists='append', index=False, method='multi')
-
-class S3Manager:
-    """S3 Manager with enhanced data handling and validation"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.client = boto3.client('s3', **config)
+# ======================
+# Database Manager Base
+# ======================
+class DatabaseManager:
+    def __init__(self, config: Dict):
         self.config = config
-        
+        self.migration_lock = Lock()
+        self.load_balancer = ConnectionLoadBalancer(config)
+        self._init_metrics()
+
+    def _init_metrics(self):
+        start_http_server(9000)
+        event.listen(self.engine, 'connect', self._track_connection)
+        event.listen(self.engine, 'close', self._track_disconnect)
+
+    def _track_connection(self, conn, branch):
+        DB_CONNECTIONS.labels(state='active').inc()
+
+    def _track_disconnect(self, conn):
+        DB_CONNECTIONS.labels(state='active').dec()
+
+    @QUERY_DURATION.labels(operation='migration').time()
+    def run_migrations(self):
+        """Execute schema migrations using Alembic"""
+        with self.migration_lock:
+            alembic_cfg = alembic_config.Config("alembic.ini")
+            alembic_cfg.attributes['configure_logger'] = False
+            command.upgrade(alembic_cfg, "head")
+
+    def track_changes(self, table: str):
+        """Enable change data capture for a table"""
+        self.execute(f"""
+            ALTER TABLE {table} 
+            REPLICA IDENTITY FULL;
+            CREATE PUBLICATION {table}_pub 
+            FOR TABLE {table} WITH (publish = 'insert,update,delete');
+        """)
+
+    def get_changes(self, slot_name: str) -> List[Dict]:
+        """Retrieve captured changes"""
+        return self.load_balancer.execute_query(
+            "SELECT * FROM pg_logical_slot_get_changes(%s, NULL, NULL);",
+            (slot_name,)
+        )
+
+# ======================
+# Connection Load Balancing
+# ======================
+class ConnectionLoadBalancer:
+    def __init__(self, config: Dict):
+        self.read_replicas = config.get('read_replicas', [])
+        self.write_engine = create_engine(config['primary'])
+        self.read_engines = [create_engine(replica) for replica in self.read_replicas]
+        self.replica_index = 0
+        self.lock = Lock()
+
+    def get_read_connection(self):
+        """Round-robin read replica selection"""
+        with self.lock:
+            engine = self.read_engines[self.replica_index]
+            self.replica_index = (self.replica_index + 1) % len(self.read_engines)
+            return engine.connect()
+
+    def execute_query(self, query: str, params=None, read_only=True):
+        """Route query to appropriate connection"""
+        if read_only and self.read_replicas:
+            with self.get_read_connection() as conn:
+                return conn.execute(text(query), params or {})
+        else:
+            with self.write_engine.connect() as conn:
+                return conn.execute(text(query), params or {})
+
+# ======================
+# S3 Manager Enhancements
+# ======================
+class S3Manager:
+    COMPRESSION_OPTIONS = {
+        'snappy': {'compression': 'snappy'},
+        'gzip': {'compression': 'gzip'},
+        'brotli': {'compression': 'brotli'}
+    }
+
+    def __init__(self, config: Dict):
+        self.client = boto3.client('s3', **config)
+        self.encryption = ColumnarEncryption(config.get('encryption_keys', {}))
+
+    @QUERY_DURATION.labels(operation='s3_upload').time()
     def upload_dataframe(
         self,
         df: pd.DataFrame,
         bucket: str,
         key: str,
-        format: str = 'parquet',
-        validation_schema: Dict = None
+        compression: str = 'snappy',
+        encryption_map: Dict[str, str] = None
     ) -> str:
-        """Upload DataFrame with format conversion and validation"""
-        self._validate_data(df, validation_schema)
+        """Upload DataFrame with compression and encryption"""
+        table = pa.Table.from_pandas(df)
+        buf = pa.BufferOutputStream()
         
-        buffer = io.BytesIO()
-        if format == 'parquet':
-            df.to_parquet(buffer, engine='pyarrow')
-        elif format == 'csv':
-            df.to_csv(buffer, index=False)
-        else:
-            raise ValueError(f"Unsupported format: {format}")
-            
-        buffer.seek(0)
+        crypto_config = None
+        if encryption_map:
+            self.encryption.configure_encryption(encryption_map)
+            crypto_config = self.encryption.get_encryption_config()
+
+        pq.write_table(
+            table,
+            buf,
+            compression=self.COMPRESSION_OPTIONS.get(compression, 'snappy'),
+            encryption_config=crypto_config
+        )
+        
         self.client.put_object(
             Bucket=bucket,
             Key=key,
-            Body=buffer,
+            Body=buf.getvalue().to_pybytes(),
             ServerSideEncryption='AES256'
         )
         return f"s3://{bucket}/{key}"
-        
-    def _validate_data(self, df: pd.DataFrame, schema: Dict) -> None:
-        """Perform data validation against schema"""
-        if schema:
-            missing = [col for col in schema['required'] if col not in df.columns]
-            if missing:
-                raise ValueError(f"Missing required columns: {missing}")
-                
-            type_mismatch = []
-            for col, dtype in schema['dtypes'].items():
-                if df[col].dtype != dtype:
-                    type_mismatch.append(col)
-            if type_mismatch:
-                raise ValueError(f"Type mismatch in columns: {type_mismatch}")
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def upload_file(
-        self,
-        local_path: str,
-        bucket: str,
-        key: str,
-        convert_to: str = None
-    ) -> str:
-        """Upload file with optional format conversion"""
-        if convert_to:
-            if not local_path.endswith('.csv'):
-                raise ValueError("Conversion only supported from CSV")
-                
-            df = pd.read_csv(local_path)
-            return self.upload_dataframe(df, bucket, key, format=convert_to)
-            
-        self.client.upload_file(
-            Filename=local_path,
-            Bucket=bucket,
-            Key=key,
-            ExtraArgs={'ServerSideEncryption': 'AES256'}
-        )
-        return f"s3://{bucket}/{key}"
+# ======================
+# Change Data Capture
+# ======================
+class ChangeCapture:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+        self.change_queue = Queue(maxsize=1000)
+        self.running = False
 
-class MySQLManager(DatabaseManager):
-    """MySQL database implementation"""
-    
-    def create_engine(self) -> Engine:
-        return create_engine(f"mysql+pymysql://{self.config['user']}:{self.config['password']}"
-                            f"@{self.config['host']}:{self.config['port']}/{self.config['database']}",
-                            pool_size=10, pool_recycle=3600)
+    def start_capture(self, slot_name: str):
+        """Start streaming changes from logical replication slot"""
+        self.running = True
+        while self.running:
+            changes = self.db.get_changes(slot_name)
+            for change in changes:
+                self.change_queue.put(self._parse_change(change))
+            time.sleep(1)
 
-class SQLiteManager(DatabaseManager):
-    """SQLite database implementation"""
-    
-    def create_engine(self) -> Engine:
-        return create_engine(f"sqlite:///{self.config['database']}", pool_size=10)
+    def _parse_change(self, change: Dict) -> Dict:
+        """Parse WAL change data"""
+        return {
+            'operation': change['action'],
+            'timestamp': change['stamp'],
+            'data': json.loads(change['data'])
+        }
 
+    def get_changes(self) -> List[Dict]:
+        """Retrieve captured changes"""
+        return list(self.change_queue.queue)
+
+# ======================
 # Usage Example
+# ======================
 if __name__ == "__main__":
-    # PostgreSQL with encryption
-    pg_config = {
-        "host": "db-host",
-        "database": "football",
-        "user": "user",
-        "password": "password",
-        "port": 5432,
-        "sslmode": "verify-full",
-        "sslrootcert": "/path/to/ca-cert"
+    # Initialize with metrics and load balancing
+    db_config = {
+        'primary': 'postgresql://user:pass@primary-host/db',
+        'read_replicas': [
+            'postgresql://user:pass@replica1/db',
+            'postgresql://user:pass@replica2/db'
+        ],
+        'encryption_keys': {
+            'player_data': Fernet.generate_key()
+        }
     }
-    pg_manager = PostgresManager(pg_config)
     
-    # Execute complex query
-    results = pg_manager.execute_query("""
-        SELECT player_id, AVG(goals) 
-        FROM matches 
-        WHERE season = :season
-        GROUP BY player_id
-    """, {'season': 2023})
+    manager = DatabaseManager(db_config)
     
-    # Bulk delete old records
-    pg_manager.bulk_delete("matches", "match_date < %s", [datetime(2022, 1, 1)])
+    # Schema migration
+    manager.run_migrations()
     
-    # S3 Parquet upload with validation
-    s3_manager = S3Manager({
-        "aws_access_key_id": "key",
-        "aws_secret_access_key": "secret",
-        "region_name": "us-west-1"
+    # Enable CDC
+    manager.track_changes('player_performance')
+    capture = ChangeCapture(manager)
+    capture.start_capture('player_changes')
+    
+    # Load-balanced query
+    result = manager.load_balancer.execute_query(
+        "SELECT * FROM player_performance",
+        read_only=True
+    )
+    
+    # Encrypted S3 upload
+    s3 = S3Manager({
+        'aws_access_key_id': 'key',
+        'aws_secret_access_key': 'secret',
+        'region_name': 'us-west-1'
     })
     
-    schema = {
-        "required": ["player_id", "goals"],
-        "dtypes": {"player_id": "int64", "goals": "float64"}
-    }
-    s3_manager.upload_dataframe(
-        df=results,
-        bucket="analytics",
-        key="player_stats.parquet",
-        validation_schema=schema
+    s3.upload_dataframe(
+        df=pd.DataFrame(result),
+        bucket='player-data',
+        key='encrypted_stats.parquet',
+        compression='gzip',
+        encryption_map={'salary': 'player_data'}
     )
