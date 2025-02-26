@@ -1,158 +1,227 @@
-from pydantic import BaseModel, Field, validator, root_validator
-from typing import Optional, Dict, List, Literal
-from datetime import datetime, timezone
+from typing import List, Dict, Optional, Any
+from pydantic import BaseModel, Field, validator
+from datetime import datetime
 from enum import Enum
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import websockets
+import asyncio
+from sqlalchemy import Column, Integer, Float, String, JSON, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from contextlib import contextmanager
+import hashlib
+import json
+from typing import Literal
 
+# ----------------------
+# ORM Base Configuration
+# ----------------------
+Base = declarative_base()
+engine = create_engine('postgresql://user:pass@localhost/football')
+Session = sessionmaker(bind=engine)
+
+@contextmanager
+def db_session():
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+# ----------------------
+# Data Version Control
+# ----------------------
+class DataVersion(BaseModel):
+    hash: str
+    timestamp: datetime
+    previous: Optional[str]
+    message: str
+
+def version_control(func):
+    def wrapper(self, *args, **kwargs):
+        prev_hash = self.version.hash if self.version else ""
+        new_version = DataVersion(
+            hash=hashlib.sha256(self.json().encode()).hexdigest(),
+            timestamp=datetime.now(),
+            previous=prev_hash,
+            message=f"Updated by {func.__name__}"
+        )
+        self.version = new_version
+        return func(self, *args, **kwargs)
+    return wrapper
+
+# ----------------------
+# Position Classes
+# ----------------------
 class Position(str, Enum):
     GOALKEEPER = "GK"
     DEFENDER = "DF"
     MIDFIELDER = "MF"
     FORWARD = "FW"
+    WINGER = "WG"
 
-class PlayerData(BaseModel):
-    # Core Identification
-    player_id: int = Field(..., gt=0, description="Unique player identifier")
-    team_id: int = Field(..., gt=0, description="Team identifier")
-    match_id: int = Field(..., gt=0, description="Match identifier")
-    
-    # Basic Performance Metrics
-    goals: int = Field(0, ge=0, description="Goals scored")
-    assists: int = Field(0, ge=0, description="Assists provided")
-    minutes_played: int = Field(..., ge=0, le=120, description="Minutes played (0-120)")
-    
-    # Advanced Metrics
-    expected_goals: float = Field(0.0, ge=0, description="xG value")
-    expected_assists: float = Field(0.0, ge=0, description="xA value")
-    pass_accuracy: float = Field(..., ge=0, le=1.0, description="Pass completion percentage")
-    
-    # Physical Metrics
-    distance_covered: float = Field(..., ge=0, description="Meters covered")
-    top_speed: float = Field(..., ge=0, le=12.0, description="Top speed in m/s")
-    sprints: int = Field(0, ge=0, description="Number of sprints")
-    
-    # Positional Data
+class TrackingData(BaseModel):
+    timestamp: datetime
+    coordinates: Dict[Literal["x", "y", "z"], float]
+    speed: float
+    heart_rate: int
+
+class PositionSpecificMetrics(Base):
+    __tablename__ = "position_metrics"
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer)
+    position = Column(String)
+    metrics = Column(JSON)
+
+# ----------------------
+# Base Player Model
+# ----------------------
+class PlayerBase(BaseModel):
+    player_id: int = Field(..., gt=0)
+    team_id: int = Field(..., gt=0)
     position: Position
-    position_heatmap: Dict[str, float] = Field(
-        default_factory=dict, 
-        description="Heatmap coordinates frequency"
-    )
-    
-    # Temporal Data
-    match_date: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
-        description="UTC timestamp of match"
-    )
-    
-    # Validation Rules
-    @validator("goals", "assists", pre=True)
-    def validate_positive_integers(cls, v):
-        if not isinstance(v, int) or v < 0:
-            raise ValueError("Must be a non-negative integer")
-        return v
-    
-    @root_validator
-    def validate_minutes_consistency(cls, values):
-        mins = values.get("minutes_played", 0)
-        if mins == 0 and (values["goals"] > 0 or values["assists"] > 0):
-            raise ValueError("Player with 0 minutes cannot have goals/assists")
-        return values
+    version: Optional[DataVersion]
+    tracking_data: List[TrackingData] = []
 
-    # Derived Properties
-    @property
-    def goal_contribution(self) -> float:
-        """Total direct goal contributions"""
-        return self.goals + self.assists
-    
-    @property
-    def efficiency_ratio(self) -> float:
-        """Minutes per goal contribution"""
-        if self.minutes_played == 0:
-            return 0.0
-        return self.goal_contribution / self.minutes_played
-    
-    # Serialization Methods
-    def to_feature_dict(self) -> Dict:
-        """Format for ML model input"""
-        return {
-            "player_id": self.player_id,
-            "xg": self.expected_goals,
-            "xa": self.expected_assists,
-            "speed": self.top_speed,
-            "pass_acc": self.pass_accuracy,
-            "position": self.position.value
-        }
-
-    def to_parquet(self, path: str) -> None:
-        """Export to Parquet format"""
-        pd.DataFrame([self.dict()]).to_parquet(path)
-
-    # Analytics Methods
-    def fitness_score(self, weights: Dict = None) -> float:
-        """Calculate physical fitness score"""
-        default_weights = {
-            "distance_covered": 0.4,
-            "top_speed": 0.3,
-            "sprints": 0.3
-        }
-        weights = weights or default_weights
-        
-        return (
-            weights["distance_covered"] * np.log1p(self.distance_covered) +
-            weights["top_speed"] * self.top_speed +
-            weights["sprints"] * self.sprints
-        )
-
-    # Metadata
-    class Config:
-        json_encoders = {
-            datetime: lambda dt: dt.isoformat(),
-            Position: lambda pos: pos.value
-        }
-        schema_extra = {
-            "example": {
-                "player_id": 101,
-                "team_id": 202,
-                "match_id": 303,
-                "goals": 2,
-                "assists": 1,
-                "minutes_played": 90,
-                "expected_goals": 1.8,
-                "expected_assists": 0.9,
-                "pass_accuracy": 0.85,
-                "distance_covered": 10850.5,
-                "top_speed": 10.2,
-                "sprints": 25,
-                "position": "FW",
-                "position_heatmap": {"x": 0.7, "y": 0.3},
-                "match_date": "2023-08-15T19:30:00+00:00"
-            }
-        }
-
-class GoalkeeperData(PlayerData):
-    # Specialized goalkeeper metrics
-    saves: int = Field(0, ge=0)
-    claims: int = Field(0, ge=0)
-    punches: int = Field(0, ge=0)
-    goals_conceded: int = Field(0, ge=0)
-    
-    @validator("position")
+    @validator('position')
     def validate_position(cls, v):
-        if v != Position.GOALKEEPER:
-            raise ValueError("Position must be GK for goalkeepers")
+        if v == Position.GOALKEEPER and 'GoalkeeperData' not in cls.__name__:
+            raise ValueError("Invalid position for player type")
         return v
 
-class MatchPerformance:
-    """Container for multiple player performances"""
-    def __init__(self, performances: List[PlayerData]):
-        self.players = performances
-        
-    def team_summary(self, team_id: int) -> Dict:
-        """Generate team-level summary statistics"""
-        team_players = [p for p in self.players if p.team_id == team_id]
+    # ----------------------
+    # Real-Time Updates
+    # ----------------------
+    async def real_time_updates(self, uri: str):
+        async with websockets.connect(uri) as websocket:
+            async for message in websocket:
+                update = json.loads(message)
+                if update['player_id'] == self.player_id:
+                    self.apply_update(update)
+
+    def apply_update(self, update: Dict):
+        self.tracking_data.append(TrackingData(**update))
+        self.calculate_injury_risk()
+
+    # ----------------------
+    # Injury Risk Assessment
+    # ----------------------
+    def calculate_injury_risk(self, window: int = 5) -> float:
+        recent = self.tracking_data[-window:]
+        load = sum(td.speed**2 * td.heart_rate for td in recent)
+        return min(load / 1e6, 1.0)
+
+    # ----------------------
+    # Spatial Visualization
+    # ----------------------
+    def plot_heatmap(self):
+        df = pd.DataFrame([td.coordinates for td in self.tracking_data])
+        plt.hexbin(df['x'], df['y'], gridsize=20, cmap='Reds')
+        plt.title(f"Position Heatmap for Player {self.player_id}")
+        plt.savefig(f"heatmap_{self.player_id}.png")
+        plt.close()
+
+    # ----------------------
+    # Performance Benchmarks
+    # ----------------------
+    def compare_benchmark(self, benchmark: Dict) -> Dict:
         return {
-            "total_goals": sum(p.goals for p in team_players),
-            "total_xg": sum(p.expected_goals for p in team_players),
-            "avg_distance": np.mean([p.distance_covered for p in team_players])
+            'speed': self.avg_speed() / benchmark['speed'],
+            'distance': self.total_distance() / benchmark['distance'],
+            'intensity': self.match_intensity() / benchmark['intensity']
         }
+
+    def avg_speed(self) -> float:
+        return np.mean([td.speed for td in self.tracking_data])
+
+    def total_distance(self) -> float:
+        return sum(np.linalg.norm(
+            [td.coordinates['x'], td.coordinates['y']]
+        ) for td in self.tracking_data)
+
+    def match_intensity(self) -> float:
+        return np.mean([td.heart_rate for td in self.tracking_data])
+
+# ----------------------
+# Position-Specific Subclasses
+# ----------------------
+class GoalkeeperData(PlayerBase):
+    saves: int = 0
+    claims: int = 0
+    punches: int = 0
+    goals_conceded: int = 0
+
+    class ORM(Base):
+        __tablename__ = "goalkeepers"
+        id = Column(Integer, primary_key=True)
+        player_id = Column(Integer)
+        saves = Column(Integer)
+        claims = Column(Integer)
+        punches = Column(Integer)
+        goals_conceded = Column(Integer)
+
+class DefenderData(PlayerBase):
+    tackles: int = 0
+    interceptions: int = 0
+    clearances: int = 0
+    aerial_duels_won: int = 0
+
+class MidfielderData(PlayerBase):
+    key_passes: int = 0
+    pass_accuracy: float = 0.0
+    final_third_entries: int = 0
+
+class ForwardData(PlayerBase):
+    shots_on_target: int = 0
+    dribbles: int = 0
+    expected_goals: float = 0.0
+
+# ----------------------
+# Database Integration
+# ----------------------
+class PlayerManager:
+    @staticmethod
+    def save_to_db(player: PlayerBase):
+        with db_session() as session:
+            if isinstance(player, GoalkeeperData):
+                orm = GoalkeeperData.ORM(**player.dict())
+            # Add other position handlers
+            session.add(orm)
+
+    @staticmethod
+    def load_from_db(player_id: int) -> PlayerBase:
+        with db_session() as session:
+            goalkeeper = session.query(GoalkeeperData.ORM).filter_by(player_id=player_id).first()
+            if goalkeeper:
+                return GoalkeeperData(**goalkeeper.__dict__)
+            # Add other position queries
+
+# ----------------------
+# Usage Example
+# ----------------------
+async def main():
+    # Initialize player with real-time tracking
+    keeper = GoalkeeperData(
+        player_id=1,
+        team_id=101,
+        position=Position.GOALKEEPER
+    )
+    
+    # Start real-time updates
+    asyncio.create_task(keeper.real_time_updates("ws://tracking-feed.com"))
+    
+    # Periodically save state
+    while True:
+        PlayerManager.save_to_db(keeper)
+        keeper.plot_heatmap()
+        print(f"Injury Risk: {keeper.calculate_injury_risk():.2f}")
+        await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(main())
