@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional, Any
+from typing import List, Type, Dict, Literal, Union, Optional, Any
 from pydantic import BaseModel, Field, validator
 from datetime import datetime
 from enum import Enum
@@ -9,11 +9,10 @@ import websockets
 import asyncio
 from sqlalchemy import Column, Integer, Float, String, JSON, create_engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Query
 from contextlib import contextmanager
 import hashlib
 import json
-from typing import Literal
 
 # ----------------------
 # ORM Base Configuration
@@ -186,18 +185,86 @@ class ForwardData(PlayerBase):
 # Database Integration
 # ----------------------
 class PlayerManager:
-    @staticmethod
-    def save_to_db(player: PlayerBase):
-        with db_session() as session:
-            if isinstance(player, GoalkeeperData):
-                orm = GoalkeeperData.ORM(**player.dict())
-            # Add other position handlers
-            session.add(orm)
+    # Registry mapping player classes to their ORM counterparts
+    _registry: Dict[Type[PlayerBase], Type[Base]] = {
+        GoalkeeperData: GoalkeeperData.ORM,
+        DefenderData: DefenderData.ORM,
+        MidfielderData: MidfielderData.ORM,
+        ForwardData: ForwardData.ORM,
+        WingerData: WingerData.ORM
+    }
 
-    @staticmethod
-    def load_from_db(player_id: int) -> PlayerBase:
+    # Reverse mapping for ORM to player class resolution
+    _orm_to_player: Dict[Type[Base], Type[PlayerBase]] = {
+        orm_class: player_class 
+        for player_class, orm_class in _registry.items()
+    }
+
+    @classmethod
+    def save_to_db(cls, player: PlayerBase) -> None:
+        """Save player data to the appropriate position-specific table"""
         with db_session() as session:
-            goalkeeper = session.query(GoalkeeperData.ORM).filter_by(player_id=player_id).first()
-            if goalkeeper:
-                return GoalkeeperData(**goalkeeper.__dict__)
-            # Add other position queries
+            orm_class = cls._registry.get(type(player))
+            if not orm_class:
+                raise ValueError(f"Unsupported player type: {type(player).__name__}")
+            
+            # Convert player data to ORM model
+            orm_data = {
+                col.name: getattr(player, col.name)
+                for col in orm_class.__table__.columns
+                if hasattr(player, col.name)
+            }
+            orm_instance = orm_class(**orm_data)
+            
+            # Update existing record or create new one
+            existing = session.query(orm_class).filter_by(player_id=player.player_id).first()
+            if existing:
+                for key, value in orm_data.items():
+                    setattr(existing, key, value)
+            else:
+                session.add(orm_instance)
+                
+            session.commit()
+
+    @classmethod
+    def load_from_db(cls, player_id: int) -> PlayerBase:
+        """Load player data from the database with position detection"""
+        with db_session() as session:
+            for orm_class, player_class in cls._orm_to_player.items():
+                result: Base = session.query(orm_class).filter_by(player_id=player_id).first()
+                if result:
+                    return cls._orm_to_player_dict(result, player_class)
+            raise ValueError(f"Player {player_id} not found in any position table")
+
+    @classmethod
+    def _orm_to_player_dict(cls, orm_instance: Base, player_class: Type[PlayerBase]) -> PlayerBase:
+        """Convert SQLAlchemy ORM instance to Pydantic model"""
+        return player_class(**{
+            col.name: getattr(orm_instance, col.name)
+            for col in orm_instance.__table__.columns
+        })
+
+    @classmethod
+    def query_players(cls, position: Type[PlayerBase] = None, **filters) -> List[PlayerBase]:
+        """Generic query interface for players"""
+        with db_session() as session:
+            query = session.query
+            if position:
+                orm_class = cls._registry[position]
+                query = query(orm_class)
+                if filters:
+                    query = query.filter_by(**filters)
+                return [cls._orm_to_player_dict(instance, position) 
+                        for instance in query.all()]
+            
+            # Search across all position tables if no specific position given
+            results = []
+            for orm_class, player_class in cls._orm_to_player.items():
+                query = session.query(orm_class)
+                if filters:
+                    query = query.filter_by(**filters)
+                results.extend([
+                    cls._orm_to_player_dict(instance, player_class)
+                    for instance in query.all()
+                ])
+            return results
