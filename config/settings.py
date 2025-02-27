@@ -38,25 +38,34 @@ class APISettings(BaseSettings):
     football_data: SecretStr = Field(..., env="FOOTBALL_DATA_API_KEY")
     openweathermap: SecretStr = Field(..., env="OPENWEATHERMAP_API_KEY")
 
+        
 class Settings(BaseSettings):
-    """Main application settings with nested configurations."""
-    database: DatabaseSettings = DatabaseSettings()
-    aws: AWSSettings = AWSSettings()
-    api: APISettings = APISettings()
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
-        validate_assignment = True
-
-    @property
-    def show_redacted(self) -> dict:
-        """Return settings with sensitive data redacted"""
-        return {
-            "database": self.database.dict(exclude={"password"}),
-            "aws": self.aws.dict(exclude={"secret_access_key"}),
-            "api": self.api.dict(exclude={"football_data", "openweathermap"})
-        }
+    class AppConfig:
+        env: str = "production"
+        version: str = "1.0.0"
+        description: str = "AI-powered football tracking and analysis system"
+        secret_key: SecretStr
+        
+    class ServerConfig:
+        host: str = "0.0.0.0"
+        port: int = 5000
+        debug: bool = False
+        use_reloader: bool = False
+        
+    class SocketConfig:
+        allowed_origins: List[str] = ["http://localhost:3000"]
+        debug: bool = False
+        
+    class CeleryConfig:
+        enabled: bool = False
+        broker_url: str = "redis://localhost:6379/0"
+        result_backend: str = "redis://localhost:6379/1"
+        
+    class AIConfig:
+        model_path: str = "/models/football-ai-v1"
+        cache_dir: str = "/tmp/ai-cache"
+        
+    metrics: dict = {"port": 9100}
+    rate_limits: dict = {"default": "200/day,50/hour"}
 
 settings = Settings()
