@@ -2,7 +2,7 @@
 import logging
 import asyncio
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from config import config
 from itinerary import ItineraryRecommender
 from safety import SafetyAnalyzer
@@ -10,160 +10,155 @@ from translation import TranslationSystem, TranslationError
 from social import SocialConnector, ClusterResult
 from exceptions import SafetyAPIError, RecommendationError
 
-# Configure logging
+# Configure structured logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=config.LOG_LEVEL,
+    format='%(asctime)s - %(module)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 async def main():
     """Main async entry point for the travel assistant application"""
-    try:
-        # 1. Test Enhanced Itinerary Recommender
-        await test_recommendation_system()
+    test_cases: List[Tuple[str, callable]] = [
+        ("Recommendation System", test_recommendation_system),
+        ("Safety Analysis System", test_safety_system),
+        ("Translation System", test_translation_system),
+        ("Social Connector System", test_social_system)
+    ]
 
-        # 2. Test Safety Analysis with Async Support
-        await test_safety_system()
-
-        # 3. Test Translation System with Caching
-        await test_translation_system()
-
-        # 4. Test Social Connector with Advanced Clustering
-        await test_social_system()
-
-    except Exception as e:
-        logger.error(f"Application failed: {str(e)}", exc_info=True)
-        raise
+    for system_name, test_func in test_cases:
+        try:
+            logger.info(f"\n{'='*40}\nStarting {system_name} Tests\n{'='*40}")
+            await test_func()
+            logger.info(f"\n{'✓'*5} {system_name} Tests Completed Successfully {'✓'*5}")
+        except Exception as e:
+            logger.error(f"\n{'✗'*5} {system_name} Tests Failed: {str(e)}", exc_info=True)
+    
+    logger.info("\nAll system tests completed. Exiting application.")
 
 async def test_recommendation_system():
-    """Test the enhanced recommendation system"""
+    """Test the enhanced recommendation system with async support"""
     try:
-        logger.info("Testing Recommendation System...")
-        
         recommender = ItineraryRecommender()
-        preferences = {'adventure': 5, 'culture': 3, 'budget': 4}
+        preferences = config.DEFAULT_PREFERENCES
         
-        # Test with different parameters
-        recommendations = recommender.recommend(
+        logger.info("Generating recommendations with parameters:\n"
+                   f"Preferences: {preferences}\n"
+                   f"Top K: {config.RECOMMENDATION_TOP_K}\n"
+                   f"Max Distance: {config.RECOMMENDATION_MAX_DISTANCE}")
+        
+        recommendations = await recommender.recommend(
             preferences,
-            k=5,
-            max_distance=0.4
+            k=config.RECOMMENDATION_TOP_K,
+            max_distance=config.RECOMMENDATION_MAX_DISTANCE
         )
         
-        logger.info(f"Top Recommendations (n={len(recommendations)}):")
+        logger.info(f"Generated {len(recommendations)} recommendations:")
         for i, rec in enumerate(recommendations, 1):
             logger.info(
-                f"#{i}: Adventure: {rec['adventure']} "
-                f"Culture: {rec['culture']} Budget: {rec['budget']} "
-                f"(Similarity: {rec['similarity']:.2f})"
+                f"#{i}: {rec['name']}\n"
+                f"Adventure: {rec['adventure']} | Culture: {rec['culture']} | Budget: {rec['budget']}\n"
+                f"Similarity: {rec['similarity']:.2f}\n{'-'*40}"
             )
 
     except RecommendationError as e:
         logger.error(f"Recommendation system error: {str(e)}")
     except Exception as e:
-        logger.error("Unexpected recommendation error occurred")
+        logger.error("Unexpected error in recommendation system")
         raise
 
 async def test_safety_system():
-    """Test the enhanced safety analysis system"""
+    """Test the safety analysis system with retry logic"""
     try:
-        logger.info("\nTesting Safety Analysis System...")
-        
-        safety_analyzer = SafetyAnalyzer()
-        
-        # Test with Tokyo coordinates
-        safety_data = await safety_analyzer.get_safety_data(35.6895, 139.6917)
-        logger.info(f"Safety Data: {safety_data}")
-        
-        # Analyze risk with different text samples
-        texts = [
-            "This area is perfectly safe during daylight hours",
-            "Avoid this neighborhood after dark, frequent incidents reported",
-            "Mixed reviews about safety, generally okay with precautions"
-        ]
-        
-        for text in texts:
-            analysis = safety_analyzer.analyze_risk(text)
-            logger.info(
-                f"Risk Analysis: '{text[:30]}...' => "
-                f"{analysis.risk_level} (Confidence: {analysis.confidence:.2%})"
+        async with SafetyAnalyzer() as safety_analyzer:
+            logger.info("Testing safety analysis with Tokyo coordinates")
+            safety_data = await safety_analyzer.get_safety_data(
+                lat=35.6895,
+                lon=139.6917,
+                retries=config.SAFETY_API_RETRIES
             )
+            logger.info(f"Safety Data Analysis:\n{safety_data.to_formatted_string()}")
+            
+            logger.info("Running text risk analysis:")
+            for text in config.SAFETY_TEST_TEXTS:
+                analysis = await safety_analyzer.analyze_risk(text)
+                logger.info(
+                    f"Text: '{text[:config.TEXT_PREVIEW_LENGTH]}...'\n"
+                    f"Risk Level: {analysis.risk_level} | Confidence: {analysis.confidence:.2%}\n"
+                    f"Flags: {', '.join(analysis.flags)}"
+                )
 
     except SafetyAPIError as e:
         logger.error(f"Safety API error: {str(e)}")
     except Exception as e:
-        logger.error("Unexpected safety analysis error")
+        logger.error("Critical error in safety analysis system")
         raise
 
 async def test_translation_system():
-    """Test the enhanced translation system"""
+    """Test the translation system with enhanced error handling"""
     try:
-        logger.info("\nTesting Translation System...")
-        
-        translator = TranslationSystem()
-        
-        # Text translation with caching
-        texts = [
-            ("Hello, where is the nearest hospital?", 'es'),
-            ("Emergency exit on the right side", 'fr'),
-            ("Vegetarian food options available", 'de')
-        ]
-        
-        for text, lang in texts:
-            translated = translator.translate_text(text, lang)
-            logger.info(f"Translated ({lang}): {translated}")
-        
-        # Image translation with preprocessing
-        image_path = Path("sample_sign.jpg")
-        if image_path.exists():
-            translated_image = translator.translate_image(image_path, 'es')
-            logger.info(f"Image Translation: {translated_image}")
-        else:
-            logger.warning("Sample image not found, skipping image translation")
+        async with TranslationSystem() as translator:
+            logger.info("Testing text translations:")
+            for text, lang in config.TRANSLATION_TEST_CASES:
+                try:
+                    translated = await translator.translate_text(text, lang)
+                    logger.info(f"Original: {text}\nTranslated ({lang.upper()}): {translated}\n{'-'*40}")
+                except TranslationError as e:
+                    logger.warning(f"Translation failed for {lang}: {str(e)}")
+                    continue
 
-    except TranslationError as e:
-        logger.error(f"Translation error: {str(e)}")
+            logger.info("Testing image translation:")
+            if config.TEST_IMAGE_PATH.exists():
+                try:
+                    translated_image = await translator.translate_image(
+                        config.TEST_IMAGE_PATH,
+                        config.TARGET_LANGUAGE
+                    )
+                    logger.info(f"Image translation saved to: {translated_image}")
+                except TranslationError as e:
+                    logger.error(f"Image translation failed: {str(e)}")
+            else:
+                logger.warning("Sample image not found, skipping image translation")
+
     except Exception as e:
-        logger.error("Unexpected translation error")
+        logger.error("Critical error in translation system")
         raise
 
 async def test_social_system():
-    """Test the enhanced social connector system"""
+    """Test the social connector system with dynamic clustering"""
     try:
-        logger.info("\nTesting Social Connector System...")
-        
-        social_connector = SocialConnector()
-        
-        interests = [
-            "hiking mountain trails",
-            "visiting art museums",
-            "budget backpacking trips",
-            "luxury hotel stays",
-            "family-friendly activities"
-        ]
-        
-        # Test different clustering algorithms
-        for algorithm in ['kmeans', 'dbscan']:
-            result = social_connector.match_travelers(
-                interests,
-                algorithm=algorithm,
-                n_clusters=2 if algorithm == 'kmeans' else None
+        async with SocialConnector() as social_connector:
+            logger.info(f"Testing traveler matching with {config.SOCIAL_CLUSTERING_ALGORITHM} algorithm")
+            
+            result = await social_connector.match_travelers(
+                interests=config.SOCIAL_TEST_INTERESTS,
+                algorithm=config.SOCIAL_CLUSTERING_ALGORITHM,
+                **config.SOCIAL_ALGORITHM_PARAMS
             )
             
-            logger.info(f"\nClustering with {algorithm.upper()}:")
-            logger.info(f"Cluster Distribution: {result['cluster_counts']}")
-            logger.info(f"Silhouette Score: {result.get('silhouette_score', 'N/A')}")
+            logger.info(f"Clustering Results ({result.algorithm.upper()}):\n"
+                       f"Clusters Found: {result.cluster_count}\n"
+                       f"Silhouette Score: {result.quality_metrics.silhouette_score:.2f}\n"
+                       f"Cluster Distribution: {result.cluster_distribution}")
             
-            for cluster_id, terms in result['top_terms'].items():
-                logger.info(f"Cluster {cluster_id} Top Terms: {', '.join(terms)}")
+            for cluster_id, details in result.cluster_details.items():
+                logger.info(
+                    f"\nCluster #{cluster_id}:\n"
+                    f"Members: {details.member_count}\n"
+                    f"Top Interests: {', '.join(details.top_terms)}\n"
+                    f"Representative User: {details.representative_user}"
+                )
 
     except Exception as e:
         logger.error(f"Social connection error: {str(e)}")
         raise
-    finally:
-        await social_connector.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\nApplication interrupted by user. Shutting down gracefully...")
+    except Exception as e:
+        logger.critical(f"Critical application failure: {str(e)}", exc_info=True)
+        raise
