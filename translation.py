@@ -228,10 +228,43 @@ class TranslationSystem:
             path.exists
         )
 
-    def _calculate_ocr_confidence(self, image) -> float:
-        """Calculate OCR confidence score"""
-        # Implement confidence calculation logic
-        return 0.85  # Placeholder value
+    def _calculate_ocr_confidence(self, image: np.ndarray) -> float:
+        """Calculate weighted OCR confidence score using Tesseract data"""
+        try:
+            # Get OCR data with confidence scores
+            data = pytesseract.image_to_data(
+                image, 
+                config=self.ocr_config,
+                output_type=pytesseract.Output.DICT
+            )
+            
+            confidences = []
+            word_lengths = []
+            
+            for i in range(len(data['text'])):
+                text = data['text'][i].strip()
+                conf = float(data['conf'][i])
+                
+                if text and conf > 0:
+                    confidences.append(conf)
+                    word_lengths.append(len(text))
+                    
+            if not confidences:
+                return 0.0
+                
+            # Calculate weighted average by word length
+            total_length = sum(word_lengths)
+            weighted_conf = sum(
+                (conf * length) / total_length
+                for conf, length in zip(confidences, word_lengths)
+            )
+            
+            # Normalize to 0-1 scale (Tesseract returns 0-100)
+            return round(weighted_conf / 100, 2)
+            
+        except Exception as e:
+            logger.warning(f"Confidence calculation failed: {str(e)}")
+            return 0.0
 
     def _validate_result(self, result: TranslationResult, request: TranslationRequest):
         """Validate translation result against request"""
@@ -240,9 +273,47 @@ class TranslationSystem:
         return result
 
     async def _preprocess_text(self, text: str) -> str:
-        """Text cleaning and normalization"""
-        # Implement text preprocessing logic
-        return text.strip()
+        """Comprehensive text cleaning and normalization"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._sync_preprocess_text,
+            text
+        )
+
+    def _sync_preprocess_text(self, text: str) -> str:
+        """CPU-bound text preprocessing"""
+        import unicodedata
+        import re
+        
+        # Normalize Unicode (NFKC for compatibility composition)
+        text = unicodedata.normalize('NFKC', text)
+        
+        # Replace problematic characters
+        replacements = {
+            '“': '"', '”': '"', '‘': "'", '’': "'",
+            '—': '-', '–': '-', '…': '...', ' ': ' '  # Replace non-breaking space
+        }
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+        
+        # Remove control characters (except tab/newline)
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        
+        # Normalize whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Truncate to API limits
+        max_length = self.config.settings.max_text_length
+        if len(text) > max_length:
+            logger.warning(f"Truncating text from {len(text)} to {max_length} characters")
+            text = text[:max_length].rsplit(' ', 1)[0] + '...'
+        
+        # Language-specific cleanup
+        if self.config.settings.target_language in ['ar', 'he']:
+            text = re.sub(r'[\u200e\u200f]', '', text)  # Remove RTL/LTR marks
+        
+        return text
 
     async def _fallback_translation(self, request: TranslationRequest):
         """Fallback translation strategy"""
