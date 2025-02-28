@@ -2,168 +2,256 @@
 import cv2
 import pytesseract
 import logging
+import httpx
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, Dict
-from functools import lru_cache
-from googletrans import Translator, LANGUAGES
-from pydantic import validate_arguments
+from typing import Optional, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
+from pydantic import BaseModel, ValidationError
+from cachetools import TTLCache
+from config import AsyncConfigManager
+from exceptions import TranslationError, ImageTranslationError
 
 logger = logging.getLogger(__name__)
 
-class TranslationError(Exception):
-    """Custom exception for translation failures"""
+class TranslationRequest(BaseModel):
+    """Pydantic model for translation request validation"""
+    text: str
+    target_lang: str
+    source_lang: Optional[str] = 'auto'
+    format: Optional[str] = 'text'
+    fallback: Optional[bool] = True
 
-class OCRError(Exception):
-    """Custom exception for OCR-related failures"""
-
-class UnsupportedLanguageError(ValueError):
-    """Exception for unsupported target languages"""
+class TranslationResult(BaseModel):
+    """Structured translation result model"""
+    source_text: str
+    translated_text: str
+    source_lang: str
+    target_lang: str
+    confidence: Optional[float]
+    detected_lang: Optional[str]
+    metadata: Dict[str, Any]
 
 class TranslationSystem:
     """
-    Enhanced translation system with OCR capabilities and advanced features
+    Async translation system with OCR and text translation capabilities
     
     Features:
-    - Multiple OCR preprocessing techniques
-    - Translation caching
-    - Language validation
-    - Adaptive image processing
-    - Retry mechanism for API calls
+    - Async context manager pattern
+    - Multi-engine support (Google, DeepL)
+    - Advanced image preprocessing
+    - Configurable caching
+    - Automatic fallback handling
     """
     
-    def __init__(
-        self,
-        translator: Optional[Translator] = None,
-        ocr_config: str = r'--oem 3 --psm 6',
-        preprocess_steps: Tuple[str, ...] = ('grayscale', 'denoise')
-    ):
-        """
-        Initialize translation system
-        
-        Args:
-            translator: Optional preconfigured translator instance
-            ocr_config: Tesseract OCR configuration
-            preprocess_steps: Tuple of image preprocessing steps to apply
-        """
-        self.translator = translator or Translator()
-        self.ocr_config = ocr_config
-        self.preprocess_steps = preprocess_steps
-        self.supported_languages = LANGUAGES
+    def __init__(self, config: AsyncConfigManager):
+        self.config = config
+        self._client = httpx.AsyncClient()
+        self.cache = TTLCache(maxsize=1000, ttl=timedelta(hours=1))
+        self._executor = ThreadPoolExecutor()
+        self.ocr_config = r'--oem 3 --psm 6'
+        self._deepl_url = "https://api.deepl.com/v2/translate"
 
-    @validate_arguments
-    def translate_text(
-        self,
-        text: str,
-        dest_lang: str = 'es',
-        src_lang: Optional[str] = None
-    ) -> str:
+    async def __aenter__(self):
+        """Async initialization"""
+        await self._verify_credentials()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup resources"""
+        await self._client.aclose()
+        self._executor.shutdown(wait=False)
+
+    async def _verify_credentials(self):
+        """Validate translation service credentials"""
+        if not self.config.translator:
+            raise TranslationError("Translation service not configured")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=10))
+    async def translate_text(self, request: TranslationRequest) -> TranslationResult:
         """
-        Translate text with validation and caching
+        Translate text with enhanced error handling and fallback
         
         Args:
-            text: Text to translate (1-5000 characters)
-            dest_lang: Target language code (default: Spanish)
-            src_lang: Optional source language code
+            request: TranslationRequest with parameters
             
         Returns:
-            Translated text or original on failure
+            TranslationResult with detailed metadata
         """
-        self._validate_language_code(dest_lang)
-        return self._cached_translation(text, dest_lang, src_lang)
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1))
-    def _cached_translation(
-        self,
-        text: str,
-        dest_lang: str,
-        src_lang: Optional[str]
-    ) -> str:
-        """Retryable translation method with caching"""
         try:
-            result = self.translator.translate(
-                text,
-                dest=dest_lang,
-                src=src_lang
+            # Check cache first
+            cache_key = f"{request.source_lang}-{request.target_lang}-{hash(request.text)}"
+            if cache_key in self.cache:
+                logger.debug("Returning cached translation")
+                return self.cache[cache_key]
+
+            # Preprocess text
+            cleaned_text = await self._preprocess_text(request.text)
+
+            # Choose translation engine
+            result = await self._translate_with_engine(cleaned_text, request)
+
+            # Validate and cache result
+            validated = self._validate_result(result, request)
+            self.cache[cache_key] = validated
+            return validated
+
+        except Exception as e:
+            if request.fallback:
+                return await self._fallback_translation(request)
+            raise TranslationError(f"Translation failed: {str(e)}") from e
+
+    async def _translate_with_engine(self, text: str, request: TranslationRequest):
+        """Select translation engine based on configuration"""
+        if self.config.settings.deepl_api_key:
+            return await self._translate_deepl(text, request)
+        return await self._translate_google(text, request)
+
+    async def _translate_deepl(self, text: str, request: TranslationRequest):
+        """Translate using DeepL API"""
+        params = {
+            "auth_key": self.config.settings.deepl_api_key,
+            "text": text,
+            "target_lang": request.target_lang.upper(),
+            "source_lang": request.source_lang.upper()
+        }
+        
+        response = await self._client.post(
+            self._deepl_url,
+            data=params,
+            timeout=self.config.settings.translation_timeout
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        return TranslationResult(
+            source_text=text,
+            translated_text=data['translations'][0]['text'],
+            source_lang=data['translations'][0]['detected_source_language'].lower(),
+            target_lang=request.target_lang,
+            confidence=data['translations'][0]['confidence'],
+            metadata={"engine": "deepl"}
+        )
+
+    async def _translate_google(self, text: str, request: TranslationRequest):
+        """Translate using Google's service"""
+        loop = asyncio.get_running_loop()
+        try:
+            translated = await loop.run_in_executor(
+                self._executor,
+                lambda: self.config.translator.translate(
+                    text,
+                    dest=request.target_lang,
+                    src=request.source_lang
+                )
             )
-            return result.text
+            return TranslationResult(
+                source_text=text,
+                translated_text=translated.text,
+                source_lang=translated.src.lower(),
+                target_lang=translated.dest.lower(),
+                detected_lang=translated.src.lower(),
+                metadata={"engine": "google"}
+            )
         except Exception as e:
-            logger.error(f"Translation failed: {str(e)}")
-            raise TranslationError("Text translation failed") from e
+            raise TranslationError("Google translation failed") from e
 
-    @validate_arguments
-    def translate_image(
-        self,
-        img_path: Path,
-        dest_lang: str = 'es',
-        ocr_config: Optional[str] = None
-    ) -> str:
+    async def translate_image(self, image_path: Path) -> TranslationResult:
         """
-        Translate text from image with enhanced OCR processing
+        Translate text in images with advanced preprocessing
         
         Args:
-            img_path: Path to image file
-            dest_lang: Target language code
-            ocr_config: Optional custom OCR configuration
+            image_path: Path to image file
             
         Returns:
-            Translated text or empty string on failure
+            TranslationResult with image metadata
         """
         try:
-            self._validate_image_path(img_path)
-            processed_img = self._preprocess_image(img_path)
-            text = self._ocr_extract(processed_img, ocr_config)
-            return self.translate_text(text, dest_lang)
-        except Exception as e:
-            logger.error(f"Image translation failed: {str(e)}")
-            return ""
+            if not await self._check_image_exists(image_path):
+                raise ImageTranslationError("Image file not found")
 
-    def _preprocess_image(self, img_path: Path) -> np.ndarray:
-        """Apply configured image preprocessing steps"""
-        img = cv2.imread(str(img_path))
+            # Async image processing
+            loop = asyncio.get_running_loop()
+            img = await loop.run_in_executor(
+                self._executor,
+                self._preprocess_image,
+                image_path
+            )
+
+            # OCR processing
+            text = await loop.run_in_executor(
+                self._executor,
+                pytesseract.image_to_string,
+                img,
+                config=self.ocr_config
+            )
+
+            # Translate extracted text
+            translation = await self.translate_text(
+                TranslationRequest(
+                    text=text,
+                    target_lang=self.config.settings.target_language
+                )
+            )
+
+            return TranslationResult(
+                **translation.dict(),
+                metadata={
+                    **translation.metadata,
+                    "image_path": str(image_path),
+                    "ocr_confidence": self._calculate_ocr_confidence(img)
+                }
+            )
+
+        except Exception as e:
+            raise ImageTranslationError(f"Image translation failed: {str(e)}") from e
+
+    def _preprocess_image(self, image_path: Path):
+        """Advanced image preprocessing for OCR"""
+        img = cv2.imread(str(image_path))
         if img is None:
-            raise OCRError("Failed to read image file")
-            
-        for step in self.preprocess_steps:
-            if step == 'grayscale':
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            elif step == 'denoise':
-                img = cv2.fastNlMeansDenoisingColored(img)
-            elif step == 'threshold':
-                img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-            elif step == 'upscale':
-                img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                
-        return img
+            raise ImageTranslationError("Invalid image file")
 
-    def _ocr_extract(
-        self,
-        image: np.ndarray,
-        custom_config: Optional[str]
-    ) -> str:
-        """Perform OCR with error handling"""
-        try:
-            return pytesseract.image_to_string(
-                image,
-                config=custom_config or self.ocr_config
-            )
-        except pytesseract.TesseractError as e:
-            raise OCRError(f"OCR processing failed: {str(e)}") from e
+        # Preprocessing pipeline
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        resized = cv2.resize(denoised, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        _, threshold = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        return threshold
 
-    def _validate_language_code(self, lang_code: str) -> None:
-        """Validate language code against supported languages"""
-        if lang_code not in self.supported_languages:
-            raise UnsupportedLanguageError(f"Unsupported language: {lang_code}")
+    async def _check_image_exists(self, path: Path) -> bool:
+        """Async file existence check"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            path.exists
+        )
 
-    def _validate_image_path(self, path: Path) -> None:
-        """Validate image path exists and is readable"""
-        if not path.exists():
-            raise FileNotFoundError(f"Image not found: {path}")
-        if path.stat().st_size > 10 * 1024 * 1024:  # 10MB limit
-            raise ValueError("Image file too large")
+    def _calculate_ocr_confidence(self, image) -> float:
+        """Calculate OCR confidence score"""
+        # Implement confidence calculation logic
+        return 0.85  # Placeholder value
 
-    @lru_cache(maxsize=1000)
-    def cached_translate_text(self, text: str, dest_lang: str) -> str:
-        """Cached version of translate_text for frequent requests"""
-        return self.translate_text(text, dest_lang)
+    def _validate_result(self, result: TranslationResult, request: TranslationRequest):
+        """Validate translation result against request"""
+        if len(result.translated_text) == 0:
+            raise ValidationError("Empty translation result")
+        return result
+
+    async def _preprocess_text(self, text: str) -> str:
+        """Text cleaning and normalization"""
+        # Implement text preprocessing logic
+        return text.strip()
+
+    async def _fallback_translation(self, request: TranslationRequest):
+        """Fallback translation strategy"""
+        logger.warning("Using fallback translation strategy")
+        return TranslationResult(
+            source_text=request.text,
+            translated_text=request.text,
+            source_lang=request.source_lang,
+            target_lang=request.target_lang,
+            confidence=0.0,
+            metadata={"fallback": True}
+        )
