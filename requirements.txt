@@ -1,0 +1,8 @@
+tweepy
+textblob
+openai
+python-dotenv
+solana
+celery
+flask
+flask-socketio
