@@ -4,27 +4,82 @@ services:
   app:
     build: .
     ports:
-      - "5000:5000"
+      - "443:5000"
     env_file:
       - .env
+    environment:
+      - NODE_ENV=production
+    secrets:
+      - solana_private_key
+      - twitter_secrets
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
     depends_on:
       - redis
-    command: python -m main
+      - prometheus
 
   celery:
     build: .
-    env_file:
-      - .env
+    secrets:
+      - solana_private_key
+      - twitter_secrets
+    command: celery -A tasks worker --loglevel=info
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
     depends_on:
       - redis
-    command: celery -A tasks worker --loglevel=info
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    command: redis-server --requirepass $${REDIS_PASSWORD}
+    env_file:
+      - .env
     volumes:
       - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/ssl
+    depends_on:
+      - app
 
 volumes:
   redis_data:
+  ssl:
+
+secrets:
+  solana_private_key:
+    file: ./secrets/solana_private_key.txt
+  twitter_secrets:
+    file: ./secrets/twitter_secrets.env
