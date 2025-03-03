@@ -116,10 +116,52 @@ def notify_failure(self, data: Dict[str, Any], error: str):
     except Exception as e:
         logger.error(f"Notification failed: {str(e)}")
 
+from datetime import datetime
+from typing import Dict, Any
+
 def update_dashboard_metrics(self, data: Dict[str, Any], error: str):
     """Update monitoring dashboard with failure details"""
-    # Implement your dashboard-specific metrics updates here
-    pass
+    try:
+        # Get reference to metrics collector
+        from dashboard import metrics
+        
+        # Add detailed error entry
+        error_entry = {
+            'timestamp': datetime.utcnow(),
+            'receiver': data['receiver'],
+            'amount': data['amount'],
+            'task_id': data.get('task_id'),
+            'error': error,
+            'retries': self.request.retries
+        }
+        
+        # Append to error history (keep last 100 errors)
+        metrics.metrics.setdefault('error_details', []).append(error_entry)
+        if len(metrics.metrics['error_details']) > 100:
+            metrics.metrics['error_details'].pop(0)
+            
+        # Update failure counters
+        metrics.metrics['engagement']['airdrops_failed'] += 1
+        metrics.metrics['solana']['failures'] = metrics.metrics['solana'].get('failures', 0) + 1
+        
+        # Add urgent alert for critical failures
+        if self.request.retries >= Config.MAX_AIRDROP_RETRIES - 1:
+            alert_msg = (f"Critical airdrop failure to {data['receiver'][:6]}... "
+                        f"Amount: {data['amount']/1e9:.4f} SOL, Error: {error[:50]}")
+            metrics.metrics['alerts'].insert(0, {  # Add at beginning for visibility
+                'type': 'critical',
+                'message': alert_msg,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+        # Update error rate statistics
+        error_rate = (metrics.metrics['api_usage'].get('solana_errors', 0) /
+                     (metrics.metrics['api_usage'].get('solana_success', 0) +
+                      metrics.metrics['api_usage'].get('solana_errors', 1)))
+        metrics.metrics['solana']['error_rate'] = error_rate
+        
+    except Exception as e:
+        logger.error(f"Failed to update dashboard metrics: {str(e)}")
 
 @celery_app.task
 def cleanup_airdrop_history(days: int = 7):
