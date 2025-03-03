@@ -1,9 +1,34 @@
-tweepy
-textblob
-openai
-python-dotenv
-solana
-celery
-flask
-flask-socketio
-vaderSentiment 
+# Core dependencies
+tweepy==4.14.0
+textblob==0.17.1
+openai==1.12.0
+python-dotenv==1.0.0
+
+# Solana ecosystem
+solana==0.29.0
+solders==0.18.0  # Required for modern Solana transactions
+
+# Task queue
+celery==5.3.6
+redis==5.0.1  # Default broker
+
+# Dashboard & Web
+flask==3.0.2
+flask-socketio==5.3.6
+gevent==23.9.1
+gevent-websocket==0.10.1
+
+# NLP & Sentiment
+vaderSentiment==3.3.2
+
+# Utilities
+cachetools==5.3.2  # For reply caching
+requests==2.31.0    # For webhook notifications
+typing-extensions==4.9.0  # For type hints support
+
+# Async/Threading
+aiohttp==3.9.1
+asyncio==3.4.3
+
+# Security
+python-decouple==3.8  # Enhanced config handling
