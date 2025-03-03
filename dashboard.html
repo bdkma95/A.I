@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ coin_name }} Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+</head>
+<body>
+    <h1>{{ coin_name }} ({{ coin_symbol }}) Monitoring</h1>
+    
+    <div class="grid">
+        <!-- Engagement Metrics -->
+        <div class="card">
+            <h2>Engagement Metrics</h2>
+            <canvas id="engagementChart"></canvas>
+            <div id="sentimentGauge"></div>
+        </div>
+
+        <!-- Solana Metrics -->
+        <div class="card">
+            <h2>Solana Metrics</h2>
+            <p>Balance: <span id="solBalance">Loading...</span></p>
+            <p>Transactions: <span id="solTransactions">0</span></p>
+            <canvas id="airdropChart"></canvas>
+        </div>
+
+        <!-- Alerts -->
+        <div class="card">
+            <h2>System Alerts</h2>
+            <div id="alertsContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        
+        // Initialize charts
+        const engagementChart = new Chart(document.getElementById('engagementChart'), {
+            type: 'bar',
+            data: { /* ... */ }
+        });
+
+        // Update metrics
+        socket.on('update_metrics', (metrics) => {
+            // Update engagement metrics
+            document.getElementById('solBalance').textContent = 
+                `${(metrics.solana.balance / 1e9).toFixed(2)} SOL`;
+            
+            // Update alerts
+            const alertsContainer = document.getElementById('alertsContainer');
+            alertsContainer.innerHTML = metrics.alerts.map(alert => 
+                `<div class="alert ${alert.type}">${alert.message}</div>`
+            ).join('');
+            
+            // Update charts
+            engagementChart.data.datasets[0].data = [
+                metrics.engagement.likes,
+                metrics.engagement.retweets,
+                metrics.engagement.replies
+            ];
+            engagementChart.update();
+        });
+    </script>
+</body>
+</html>
