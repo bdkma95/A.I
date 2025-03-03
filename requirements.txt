@@ -6,3 +6,4 @@ solana
 celery
 flask
 flask-socketio
+vaderSentiment 
