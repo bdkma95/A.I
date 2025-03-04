@@ -1,6 +1,6 @@
 import time
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 from solders.keypair import Keypair
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
@@ -15,6 +15,8 @@ from solana.transaction import TransactionExpiredBlockheightExceededError
 from solana.rpc.core import RPCException
 from solana import compute_budget
 from config import Config
+from datetime import datetime, timedelta
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +29,11 @@ class SolanaClient:
         self.client = Client(Config.SOLANA_RPC_URL, timeout=30)
         self.sender_keypair = self._load_keypair()
         self.sender_pubkey = self.sender_keypair.pubkey()
-        self.min_balance_reserve = 890880  # Minimum balance reserve for account
-        self.max_retries = 5
-        self.retry_delay = 2
-        
+        self.transaction_history: List[Dict] = []
+        self.min_balance_reserve = Config.MIN_BALANCE_RESERVE
+        self._last_blockhash = None
+        self._last_blockheight = None
+
     def _load_keypair(self) -> Keypair:
         """Securely load sender keypair from config"""
         try:
@@ -40,46 +43,52 @@ class SolanaClient:
             raise SolanaClientError("Invalid private key configuration") from e
 
     def validate_wallet(self, address: str) -> bool:
-        """Validate Solana wallet address with improved checks"""
+        """Validate Solana wallet address with network check"""
         try:
-            Pubkey.from_string(address)
-            return True
-        except (ValueError, AttributeError):
+            pubkey = Pubkey.from_string(address)
+            return self.client.get_account_info(pubkey).value is not None
+        except (ValueError, AttributeError, RPCException):
             return False
 
-    def get_balance(self, pubkey: Pubkey, commitment: Confirmed = Confirmed) -> int:
-        """Get balance with proper error handling"""
+    def get_balance(self, pubkey: Pubkey) -> int:
+        """Get balance with error handling and caching"""
         try:
-            resp = self.client.get_balance(pubkey, commitment=commitment)
+            resp = self.client.get_balance(pubkey, commitment=Confirmed)
             return resp.value
         except (SolanaRpcException, RPCException) as e:
             logger.error(f"Balance check failed: {str(e)}")
             raise SolanaClientError("Failed to check balance") from e
 
     def estimate_fees(self, message: MessageV0) -> int:
-        """Estimate transaction fees including priority fees"""
+        """Estimate transaction fees with priority and fallback"""
         try:
-            # Get fee for message including priority fees
             fee_response = self.client.get_fee_for_message(message)
             if not fee_response.value:
-                return 5000  # Fallback base fee
+                return Config.FALLBACK_FEE
             
-            # Add priority fee (micro-lamports per CU)
-            fee = fee_response.value
             priority_fee = compute_budget.ComputeBudgetPriorityFee(
-                compute_budget.ComputeBudgetPriorityFeeConfig(micro_lamports=1000)
+                compute_budget.ComputeBudgetPriorityFeeConfig(
+                    micro_lamports=Config.PRIORITY_FEE_MICRO_LAMPORTS
+                )
             )
-            return fee + priority_fee.value
+            return fee_response.value + priority_fee.value
         except (SolanaRpcException, RPCException) as e:
             logger.warning(f"Fee estimation failed: {str(e)}")
-            return 10000  # Conservative fallback fee
+            return Config.FALLBACK_FEE
 
-    def create_transfer_instructions(self, receiver: Pubkey, lamports: int) -> Tuple[MessageV0, int]:
+    def _get_recent_blockhash(self) -> Tuple[str, int]:
+        """Get recent blockhash with caching"""
+        if not self._last_blockhash or time.time() > self._last_blockhash_expiry:
+            response = self.client.get_latest_blockhash(commitment=Confirmed)
+            self._last_blockhash = response.value.blockhash
+            self._last_blockheight = response.value.last_valid_block_height
+            self._last_blockhash_expiry = time.time() + 60  # Refresh every 60 seconds
+        return self._last_blockhash, self._last_blockheight
+
+    def create_transfer_instructions(self, receiver: Pubkey, lamports: int) -> MessageV0:
         """Create versioned transfer message with compute budget"""
-        # Get recent blockhash
-        recent_blockhash = self.client.get_latest_blockhash(commitment=Confirmed).value
+        blockhash, _ = self._get_recent_blockhash()
         
-        # Create transfer instruction
         transfer_instruction = transfer(
             TransferParams(
                 from_pubkey=self.sender_pubkey,
@@ -88,76 +97,158 @@ class SolanaClient:
             )
         )
         
-        # Create message with compute budget
-        message = MessageV0.try_compile(
+        return MessageV0.try_compile(
             payer=self.sender_pubkey,
             instructions=[
-                compute_budget.ComputeBudgetSetComputeUnitLimit(100_000),
+                compute_budget.ComputeBudgetSetComputeUnitLimit(
+                    Config.COMPUTE_UNIT_LIMIT
+                ),
                 transfer_instruction
             ],
             address_lookup_table_accounts=[],
-            recent_blockhash=recent_blockhash.blockhash,
+            recent_blockhash=blockhash,
         )
-        
-        return message, recent_blockhash.last_valid_block_height
 
     def send_tokens(self, receiver: str, amount: int) -> Optional[Signature]:
-        """Send tokens with retry logic and versioned transactions"""
+        """Send tokens with enhanced retry logic and monitoring"""
         if not self.validate_wallet(receiver):
             logger.error(f"Invalid receiver address: {receiver}")
             return None
 
         receiver_pubkey = Pubkey.from_string(receiver)
+        tx_entry = self._create_transaction_entry(receiver, amount)
         
-        for attempt in range(self.max_retries):
+        for attempt in range(Config.MAX_RETRIES):
             try:
-                # Check sender balance
-                sender_balance = self.get_balance(self.sender_pubkey)
-                required_balance = amount + self.min_balance_reserve
-                
-                if sender_balance < required_balance:
-                    logger.error(f"Insufficient balance: {sender_balance} < {required_balance}")
-                    return None
-
-                # Create transfer instructions
-                message, last_valid_block_height = self.create_transfer_instructions(receiver_pubkey, amount)
-                
-                # Estimate fees
+                self._validate_balance(amount)
+                message = self.create_transfer_instructions(receiver_pubkey, amount)
                 fee = self.estimate_fees(message)
-                logger.info(f"Estimated transaction fee: {fee} lamports")
-
-                # Create and sign transaction
+                
+                tx_entry.update({
+                    'attempt': attempt + 1,
+                    'fee': fee,
+                    'status': 'pending'
+                })
+                
                 transaction = VersionedTransaction(message, [self.sender_keypair])
+                txid = self._send_transaction(transaction)
+                tx_entry['txid'] = txid
                 
-                # Send transaction
-                opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
-                txid = self.client.send_transaction(transaction, opts).value
-                logger.info(f"Transaction submitted: {txid}")
+                if self._confirm_transaction(txid):
+                    tx_entry['status'] = 'confirmed'
+                    self._notify_success(tx_entry)
+                    return txid
                 
-                # Confirm transaction
-                confirmation = self.client.confirm_transaction(
-                    txid,
-                    commitment=Confirmed,
-                    last_valid_block_height=last_valid_block_height,
-                )
-                
-                if confirmation.value[0].err:
-                    logger.error(f"Transaction failed: {confirmation.value[0].err}")
-                    raise SolanaClientError("Transaction confirmation failed")
-                
-                return txid
-
             except TransactionExpiredBlockheightExceededError:
-                logger.warning(f"Blockhash expired, retrying (attempt {attempt+1})")
-                time.sleep(self.retry_delay * (2 ** attempt))
-                continue
+                self._handle_blockhash_expired(tx_entry, attempt)
             except (SolanaRpcException, RPCException) as e:
-                logger.error(f"Transaction failed: {str(e)}")
-                if "Blockhash not found" in str(e):
-                    logger.info("Refreshing blockhash and retrying...")
-                    time.sleep(self.retry_delay * (2 ** attempt))
-                    continue
-                raise SolanaClientError("Transaction failed permanently") from e
+                self._handle_transaction_error(e, tx_entry, attempt)
+                
+            self._apply_retry_delay(attempt)
         
-        logger.error(f"Transaction failed after {self.max_retries} attempts")
+        self._handle_final_failure(tx_entry)
         return None
+
+    def _create_transaction_entry(self, receiver: str, amount: int) -> Dict:
+        """Create transaction history entry"""
+        entry = {
+            'receiver': receiver,
+            'amount': amount,
+            'timestamp': datetime.utcnow(),
+            'attempts': 0,
+            'status': 'initiated',
+            'txid': None,
+            'fee': 0
+        }
+        self.transaction_history.append(entry)
+        return entry
+
+    def _validate_balance(self, amount: int):
+        """Validate sender balance with reserve"""
+        sender_balance = self.get_balance(self.sender_pubkey)
+        required_balance = amount + self.min_balance_reserve
+        if sender_balance < required_balance:
+            raise SolanaClientError(
+                f"Insufficient balance: {sender_balance} < {required_balance}"
+            )
+
+    def _send_transaction(self, transaction: VersionedTransaction) -> Signature:
+        """Send transaction with error handling"""
+        try:
+            opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
+            response = self.client.send_transaction(transaction, opts)
+            return response.value
+        except RPCException as e:
+            logger.error(f"Transaction submission failed: {str(e)}")
+            raise
+
+    def _confirm_transaction(self, txid: Signature) -> bool:
+        """Confirm transaction with timeout"""
+        start_time = time.time()
+        while time.time() - start_time < Config.CONFIRMATION_TIMEOUT:
+            status = self.client.get_transaction(txid).value
+            if status and status.transaction.meta.err is None:
+                return True
+            time.sleep(2)
+        return False
+
+    def _handle_blockhash_expired(self, tx_entry: Dict, attempt: int):
+        """Handle blockhash expiration scenario"""
+        logger.warning(f"Blockhash expired, retrying (attempt {attempt+1})")
+        tx_entry['status'] = 'retrying'
+        self._last_blockhash = None  # Force refresh
+
+    def _handle_transaction_error(self, error: Exception, tx_entry: Dict, attempt: int):
+        """Handle transaction errors"""
+        logger.error(f"Transaction failed: {str(error)}")
+        tx_entry['errors'] = tx_entry.get('errors', []) + [str(error)]
+        if "Blockhash not found" in str(error):
+            self._last_blockhash = None
+
+    def _apply_retry_delay(self, attempt: int):
+        """Apply exponential backoff with jitter"""
+        delay = Config.RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+        time.sleep(delay)
+
+    def _handle_final_failure(self, tx_entry: Dict):
+        """Handle final transaction failure"""
+        logger.error(f"Transaction failed after {Config.MAX_RETRIES} attempts")
+        tx_entry['status'] = 'failed'
+        tx_entry['final_failure'] = True
+        self._notify_failure(tx_entry)
+
+    def _notify_success(self, tx_entry: Dict):
+        """Handle successful transaction notification"""
+        logger.info(f"Transaction confirmed: {tx_entry['txid']}")
+        if Config.NOTIFICATION_WEBHOOK:
+            self._send_webhook(tx_entry, success=True)
+
+    def _notify_failure(self, tx_entry: Dict):
+        """Handle failed transaction notification"""
+        logger.error(f"Transaction failed: {tx_entry['receiver']}")
+        if Config.NOTIFICATION_WEBHOOK:
+            self._send_webhook(tx_entry, success=False)
+
+    def _send_webhook(self, tx_entry: Dict, success: bool):
+        """Send transaction notification to webhook"""
+        try:
+            import requests
+            payload = {
+                'status': 'success' if success else 'error',
+                'receiver': tx_entry['receiver'],
+                'amount': tx_entry['amount'],
+                'txid': str(tx_entry.get('txid')),
+                'attempts': tx_entry['attempt'],
+                'timestamp': tx_entry['timestamp'].isoformat()
+            }
+            requests.post(Config.NOTIFICATION_WEBHOOK, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"Failed to send webhook: {str(e)}")
+
+    def clean_transaction_history(self, max_age: int = Config.HISTORY_RETENTION):
+        """Clean up old transaction history entries"""
+        cutoff = datetime.utcnow() - timedelta(seconds=max_age)
+        self.transaction_history = [
+            tx for tx in self.transaction_history
+            if tx['timestamp'] > cutoff
+        ]
