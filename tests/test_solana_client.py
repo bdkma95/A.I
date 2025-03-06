@@ -74,7 +74,7 @@ async def test_network_failure_retries(mock_solana_client):
     """Test network failure retry logic with exponential backoff."""
     from asyncstdlib import itertools
     mock_solana_client.send_tokens = AsyncMock(
-        side_effect=itertools.repeat(SolanaClientError("Network error"), 3
+        side_effect=itertools.repeat(SolanaClientError("Network error"), 3)
     )
     
     with pytest.raises(SolanaClientError) as exc_info:
