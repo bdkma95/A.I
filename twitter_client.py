@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from config import Config
-from reply_generator import generate_reply, generate_personalized_reply
+from reply_generator import generate_personalized_reply, generate_reply
 from solana_client import SolanaClient
 
 logger = logging.getLogger(__name__)
