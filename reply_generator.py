@@ -13,7 +13,7 @@ from pathlib import Path
 
 # Add project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
-from config import Config
+from config import Config  # Now works!
 
 logger = logging.getLogger(__name__)
 
