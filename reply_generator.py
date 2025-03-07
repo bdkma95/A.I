@@ -1,4 +1,5 @@
 import openai
+import re
 import random
 import logging
 import hashlib
@@ -189,3 +190,17 @@ class ReplyGenerator:
         except Exception as e:
             logger.error(f"Reply generation failed: {str(e)}")
             return self._get_fallback_reply(username, 'neutral')
+        
+    # Public interface for generating replies
+    def generate_personalized_reply(tweet_text: str, username: str, tweet_id: str) -> Optional[str]:
+        """Public facing reply generation function"""
+        generator = ReplyGenerator()
+        return generator.generate_reply(
+            tweet_text=tweet_text,
+            username=username,
+            tweet_id=tweet_id
+        )
+
+    def generate_reply():
+        """Legacy compatibility"""
+        return generate_personalized_reply
