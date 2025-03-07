@@ -13,7 +13,8 @@ from solana.rpc.types import TxOpts
 from solana.exceptions import SolanaRpcException
 from solders.rpc.errors import SendTransactionPreflightFailureMessage
 from solana.rpc.core import RPCException
-from solana import compute_budget
+from solders.instruction import Instruction  # ✅ New location
+from solana.transaction import Message, Transaction
 from config import Config
 from datetime import datetime, timedelta
 import random
