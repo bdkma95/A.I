@@ -139,7 +139,7 @@ class SolanaClient:
                     self._notify_success(tx_entry)
                     return txid
                 
-            except TransactionExpiredBlockheightExceededError:
+            except SendTransactionPreflightFailureMessage:
                 self._handle_blockhash_expired(tx_entry, attempt)
             except (SolanaRpcException, RPCException) as e:
                 self._handle_transaction_error(e, tx_entry, attempt)
