@@ -7,8 +7,13 @@ import time
 from typing import Optional, Dict, List
 from textblob import TextBlob
 from cachetools import TTLCache
-from config import Config
 from functools import lru_cache
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+sys.path.append(str(Path(__file__).parent.parent))
+from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -192,18 +197,12 @@ class ReplyGenerator:
             return self._get_fallback_reply(username, 'neutral')
         
     # Public interface functions
-    def generate_personalized_reply(tweet_text: str, username: str, tweet_id: str)  -> Optional[str]:
-        """Main entry point for reply generation"""
-        return ReplyGenerator().generate_reply(
-            tweet_text=tweet_text,
-            username=username,
-            tweet_id=tweet_id
-        )
+def generate_personalized_reply(tweet_text: str, username: str, tweet_id: str) -> Optional[str]:
+    return ReplyGenerator().generate_reply(
+        tweet_text=tweet_text,
+        username=username,
+        tweet_id=tweet_id
+    )
 
-    def generate_reply(tweet_text: str, username: str) -> Optional[str]:
-        """Legacy compatibility wrapper"""
-        return generate_personalized_reply(
-            tweet_text=tweet_text,
-            username=username,
-            tweet_id="legacy_123"  # Add dummy tweet_id if needed
-        )
+def generate_reply(tweet_text: str, username: str) -> Optional[str]:
+    return generate_personalized_reply(tweet_text, username, "legacy_123")
