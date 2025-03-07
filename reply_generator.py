@@ -191,16 +191,19 @@ class ReplyGenerator:
             logger.error(f"Reply generation failed: {str(e)}")
             return self._get_fallback_reply(username, 'neutral')
         
-    # Public interface for generating replies
-    def generate_personalized_reply(tweet_text: str, username: str, tweet_id: str) -> Optional[str]:
-        """Public facing reply generation function"""
-        generator = ReplyGenerator()
-        return generator.generate_reply(
+    # Public interface functions
+    def generate_personalized_reply(tweet_text: str, username: str, tweet_id: str)  -> Optional[str]:
+        """Main entry point for reply generation"""
+        return ReplyGenerator().generate_reply(
             tweet_text=tweet_text,
             username=username,
             tweet_id=tweet_id
         )
 
-    def generate_reply():
-        """Legacy compatibility"""
-        return generate_personalized_reply
+    def generate_reply(tweet_text: str, username: str) -> Optional[str]:
+        """Legacy compatibility wrapper"""
+        return generate_personalized_reply(
+            tweet_text=tweet_text,
+            username=username,
+            tweet_id="legacy_123"  # Add dummy tweet_id if needed
+        )
