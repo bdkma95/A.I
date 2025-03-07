@@ -11,7 +11,7 @@ from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
 from solana.exceptions import SolanaRpcException
-from solana.rpc.errors import TransactionExpiredBlockheightExceededError
+from solders.rpc.errors import SendTransactionPreflightFailureMessage
 from solana.rpc.core import RPCException
 from solana import compute_budget
 from config import Config
