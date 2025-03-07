@@ -48,6 +48,14 @@ class Config:
     COIN_NAME = os.getenv("COIN_NAME", "MemeCoin")
     AIRDROP_AMOUNT = int(os.getenv("AIRDROP_AMOUNT", "1000000"))  # In lamports
     AIRDROP_PROBABILITY = float(os.getenv("AIRDROP_PROBABILITY", "0.1"))
+    MEME_COIN_SYMBOL = "YOUR_COIN_SYMBOL"  # e.g., "MEME"
+    REPLY_CACHE_SIZE = 1000
+    REPLY_CACHE_TTL = 3600  # 1 hour
+    FALLBACK_TEMPLATES = {
+        'positive': ["@{user} Thanks for the support! 🚀"],
+        'neutral': ["@{user} Appreciate your engagement!"],
+        'negative': ["@{user} We value your feedback!"]
+    }
 
     # --- Security Settings ---
     SECRET_KEY = os.getenv("SECRET_KEY", "default-insecure-secret")
