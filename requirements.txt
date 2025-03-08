@@ -24,11 +24,12 @@ uvloop==0.19.0                # Fast event loop
 
 # Web & Dashboard
 flask==3.0.2                  # Web framework
-flask-socketio==5.3.6         # Real-time communication
+Flask-SocketIO==5.3.6         # Real-time communication
 gevent==23.9.1                # WSGI server
 gunicorn==21.2.0              # Production server
 eventlet==0.35.0              # Async server
 prometheus-client==0.20.0     # Metrics endpoint
+python-socketio==5.9.0
 
 # Security & Cryptography
 python-decouple==3.8          # Secure config management
@@ -49,3 +50,4 @@ pytest-asyncio==0.23.5        # Async tests
 black==23.12.1                # Code formatting
 mypy==1.8.0                   # Static typing
 flake8==6.1.0                 # Code linting
+vaderSentiment==3.3.2
