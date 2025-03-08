@@ -3,8 +3,6 @@ import logging
 from typing import Optional, Tuple, Dict, List
 from solders.keypair import Keypair
 from solders.system_program import TransferParams, transfer
-from solders.transaction import VersionedTransaction
-from solders.message import MessageV0
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solana.rpc.api import Client
@@ -13,8 +11,9 @@ from solana.rpc.types import TxOpts
 from solana.exceptions import SolanaRpcException
 from solders.rpc.errors import SendTransactionPreflightFailureMessage
 from solana.rpc.core import RPCException
-from solders.instruction import Instruction  # ✅ New location
-from solana.transaction import Message, Transaction
+from solders.instruction import Instruction
+from solders.message import MessageV0
+from solders.transaction import VersionedTransaction
 from config import Config
 from datetime import datetime, timedelta
 import random
@@ -61,18 +60,10 @@ class SolanaClient:
             raise SolanaClientError("Failed to check balance") from e
 
     def estimate_fees(self, message: MessageV0) -> int:
-        """Estimate transaction fees with priority and fallback"""
+        """Estimate transaction fees with fallback"""
         try:
             fee_response = self.client.get_fee_for_message(message)
-            if not fee_response.value:
-                return Config.FALLBACK_FEE
-            
-            priority_fee = compute_budget.ComputeBudgetPriorityFee(
-                compute_budget.ComputeBudgetPriorityFeeConfig(
-                    micro_lamports=Config.PRIORITY_FEE_MICRO_LAMPORTS
-                )
-            )
-            return fee_response.value + priority_fee.value
+            return fee_response.value if fee_response.value else Config.FALLBACK_FEE
         except (SolanaRpcException, RPCException) as e:
             logger.warning(f"Fee estimation failed: {str(e)}")
             return Config.FALLBACK_FEE
@@ -87,7 +78,7 @@ class SolanaClient:
         return self._last_blockhash, self._last_blockheight
 
     def create_transfer_instructions(self, receiver: Pubkey, lamports: int) -> MessageV0:
-        """Create versioned transfer message with compute budget"""
+        """Create versioned transfer message with modern compute budget handling"""
         blockhash, _ = self._get_recent_blockhash()
         
         transfer_instruction = transfer(
@@ -100,14 +91,11 @@ class SolanaClient:
         
         return MessageV0.try_compile(
             payer=self.sender_pubkey,
-            instructions=[
-                compute_budget.ComputeBudgetSetComputeUnitLimit(
-                    Config.COMPUTE_UNIT_LIMIT
-                ),
-                transfer_instruction
-            ],
+            instructions=[transfer_instruction],
             address_lookup_table_accounts=[],
             recent_blockhash=blockhash,
+            compute_unit_limit=Config.COMPUTE_UNIT_LIMIT,
+            compute_unit_price=Config.PRIORITY_FEE_MICRO_LAMPORTS
         )
 
     def send_tokens(self, receiver: str, amount: int) -> Optional[Signature]:
