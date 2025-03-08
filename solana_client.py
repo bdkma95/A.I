@@ -35,12 +35,17 @@ class SolanaClient:
         self._last_blockheight = None
 
     def _load_keypair(self) -> Keypair:
-        """Securely load sender keypair from config"""
+        """Validate keypair before loading"""
+        key_str = Config.SENDER_WALLET_PRIVATE_KEY
+    
+        if len(key_str) != 88:
+            raise ValueError(f"Invalid key length: {len(key_str)} chars (needs 88)")
+    
         try:
-            return Keypair.from_base58_string(Config.SENDER_WALLET_PRIVATE_KEY)
-        except ValueError as e:
-            logger.critical("Invalid private key format")
-            raise SolanaClientError("Invalid private key configuration") from e
+            return Keypair.from_base58_string(key_str)
+        except Exception as e:
+            logger.critical(f"Key validation failed: {str(e)}")
+            raise SolanaClientError("Invalid private key") from e
 
     def validate_wallet(self, address: str) -> bool:
         """Validate Solana wallet address with network check"""
