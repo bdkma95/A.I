@@ -89,6 +89,12 @@ class Config:
     FEATURE_AIRDROP = os.getenv("FEATURE_AIRDROP", "true").lower() == "true"
     FEATURE_ENGAGEMENT = os.getenv("FEATURE_ENGAGEMENT", "true").lower() == "true"
     FEATURE_ANALYTICS = os.getenv("FEATURE_ANALYTICS", "false").lower() == "true"
+    
+    # Dashboard Configuration
+    DASHBOARD_SECRET_KEY = os.getenv("DASHBOARD_SECRET_KEY",     "default-dashboard-secret")
+    DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
+    DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "securepassword123")
+    DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8050"))
 
     @classmethod
     def validate(cls):
