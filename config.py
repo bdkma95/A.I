@@ -12,6 +12,14 @@ class Config:
     TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
     TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
     TWITTER_RATE_LIMIT = int(os.getenv("TWITTER_RATE_LIMIT", "300"))
+    
+    # Celery Configuration
+    CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+    CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+    CELERY_TASK_SERIALIZER = "json"
+    CELERY_RESULT_SERIALIZER = "json"
+    CELERY_ACCEPT_CONTENT = ["json"]
+    CELERY_TIMEZONE = "UTC"
 
     # --- Solana Configuration --- (UPDATED SECTION)
     SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
