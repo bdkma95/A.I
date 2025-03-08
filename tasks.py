@@ -11,7 +11,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-celery_app = Celery('tasks', broker=Config.CELERY_BROKER_URL)
+celery_app = Celery('tasks', broker=Config.CELERY_BROKER_URL, backend=Config.CELERY_RESULT_BACKEND)
 celery_app.conf.update(
     task_serializer='json',
     result_serializer='json',
