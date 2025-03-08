@@ -103,6 +103,11 @@ class Config:
     DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
     DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "securepassword123")
     DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8050"))
+    
+    # Airdrop Configuration
+    MAX_AIRDROP_RETRIES = int(os.getenv("MAX_AIRDROP_RETRIES", "3"))
+    AIRDROP_COOLDOWN = int(os.getenv("AIRDROP_COOLDOWN", "300"))  # 5 minutes
+    AIRDROP_MAX_DAILY = int(os.getenv("AIRDROP_MAX_DAILY", "100"))
 
     @classmethod
     def validate(cls):
