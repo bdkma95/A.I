@@ -108,6 +108,9 @@ class Config:
     METRICS_HISTORY_SIZE = int(os.getenv("METRICS_HISTORY_SIZE", "1000"))
     DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
     MIN_SOL_BALANCE = int(os.getenv("MIN_SOL_BALANCE", "100000000"))  # 0.1 SOL
+     # Debug settings (add this section)
+    DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO" if not DEBUG_MODE else "DEBUG")
     
     # Airdrop Configuration
     MAX_AIRDROP_RETRIES = int(os.getenv("MAX_AIRDROP_RETRIES", "3"))
@@ -116,13 +119,13 @@ class Config:
 
     @classmethod
     def validate(cls):
-        """Updated configuration validation"""
+        """Updated validation without DEBUG_MODE as required"""
         required = [
-            'TWITTER_API_KEY', 'TWITTER_API_SECRET',
-            'SENDER_WALLET_PUBKEY', 'SENDER_WALLET_PRIVATE_KEY',
-            'OPENAI_API_KEY', 'MIN_SOL_BALANCE',
-            'DASHBOARD_HOST', 'DASHBOARD_UPDATE_INTERVAL',
-            'DEBUG_MODE'
+            'TWITTER_API_KEY',
+            'TWITTER_API_SECRET',
+            'SENDER_WALLET_PUBKEY',
+            'SENDER_WALLET_PRIVATE_KEY',
+            'OPENAI_API_KEY'
         ]
         for var in required:
             if not getattr(cls, var):
