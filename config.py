@@ -103,15 +103,16 @@ class Config:
     DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
     DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "securepassword123")
     DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8050"))
+    DASHBOARD_UPDATE_INTERVAL = int(os.getenv("DASHBOARD_UPDATE_INTERVAL", "5"))  # seconds
+    DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+    METRICS_HISTORY_SIZE = int(os.getenv("METRICS_HISTORY_SIZE", "1000"))
+    DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    MIN_SOL_BALANCE = int(os.getenv("MIN_SOL_BALANCE", "100000000"))  # 0.1 SOL
     
     # Airdrop Configuration
     MAX_AIRDROP_RETRIES = int(os.getenv("MAX_AIRDROP_RETRIES", "3"))
     AIRDROP_COOLDOWN = int(os.getenv("AIRDROP_COOLDOWN", "300"))  # 5 minutes
     AIRDROP_MAX_DAILY = int(os.getenv("AIRDROP_MAX_DAILY", "100"))
-    
-    MIN_SOL_BALANCE = int(os.getenv("MIN_SOL_BALANCE", "100000000"))  # 0.1 SOL
-    DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
-    DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8050"))
 
     @classmethod
     def validate(cls):
@@ -120,7 +121,8 @@ class Config:
             'TWITTER_API_KEY', 'TWITTER_API_SECRET',
             'SENDER_WALLET_PUBKEY', 'SENDER_WALLET_PRIVATE_KEY',
             'OPENAI_API_KEY', 'MIN_SOL_BALANCE',
-            'DASHBOARD_HOST'
+            'DASHBOARD_HOST', 'DASHBOARD_UPDATE_INTERVAL',
+            'DEBUG_MODE'
         ]
         for var in required:
             if not getattr(cls, var):
