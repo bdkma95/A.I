@@ -109,7 +109,7 @@ class Config:
     DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
     MIN_SOL_BALANCE = int(os.getenv("MIN_SOL_BALANCE", "100000000"))  # 0.1 SOL
      # Debug settings (add this section)
-    DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+    DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"  # Default false
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO" if not DEBUG_MODE else "DEBUG")
     
     # Airdrop Configuration
@@ -119,7 +119,7 @@ class Config:
 
     @classmethod
     def validate(cls):
-        """Updated validation without DEBUG_MODE as required"""
+        """Core required configuration only"""
         required = [
             'TWITTER_API_KEY',
             'TWITTER_API_SECRET',
