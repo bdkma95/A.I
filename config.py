@@ -21,13 +21,13 @@ class Config:
     CELERY_ACCEPT_CONTENT = ["json"]
     CELERY_TIMEZONE = "UTC"
 
-    # --- Solana Configuration --- (UPDATED SECTION)
+    # --- Solana Configuration --- 
     SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
     SOLANA_WS_URL = os.getenv("SOLANA_WS_URL", "wss://api.mainnet-beta.solana.com")
     SENDER_WALLET_PRIVATE_KEY = os.getenv("SENDER_WALLET_PRIVATE_KEY")
     SENDER_WALLET_PUBKEY = os.getenv("SENDER_WALLET_PUBKEY")
     
-    # Transaction Configuration (NEW PARAMS)
+    # Transaction Configuration 
     COMPUTE_UNIT_LIMIT = int(os.getenv("COMPUTE_UNIT_LIMIT", "200000"))  # Default: 200,000
     PRIORITY_FEE_MICRO_LAMPORTS = int(os.getenv("PRIORITY_FEE_MICRO_LAMPORTS", "500"))
     FALLBACK_FEE = int(os.getenv("FALLBACK_FEE", "5000"))  # lamports
@@ -54,7 +54,7 @@ class Config:
     LOG_FILE = os.getenv("LOG_FILE", "app.log")
     REPORTING_INTERVAL = int(os.getenv("REPORTING_INTERVAL", "300"))
 
-    # --- Meme Coin Settings --- (UPDATED)
+    # --- Meme Coin Settings ---
     MEME_COIN_SYMBOL = os.getenv("MEME_COIN_SYMBOL", "MEME")
     MEME_COIN_NAME = os.getenv("MEME_COIN_NAME", "MemeCoin")
     AIRDROP_AMOUNT = int(os.getenv("AIRDROP_AMOUNT", "1000000"))
@@ -67,12 +67,14 @@ class Config:
         'negative': ["@{user} We value your feedback!"]
     }
 
-    # --- Monitoring & Alerting --- (UPDATED)
+    # --- Monitoring & Alerting ---
     NOTIFICATION_WEBHOOK = os.getenv("NOTIFICATION_WEBHOOK")
     SENTRY_DSN = os.getenv("SENTRY_DSN")
     PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9090"))
     ALERT_WEBHOOK = os.getenv("ALERT_WEBHOOK")
     ADMIN_EMAILS = os.getenv("ADMIN_EMAILS", "").split(",")
+    ENGAGEMENT_SPIKE_THRESHOLD = float(os.getenv("ENGAGEMENT_SPIKE_THRESHOLD", "2.5"))  # 250% increase
+    METRICS_UPDATE_INTERVAL = int(os.getenv("METRICS_UPDATE_INTERVAL", "60"))  # seconds
 
     # --- Security Settings ---
     SECRET_KEY = os.getenv("SECRET_KEY", "default-insecure-secret")
@@ -133,6 +135,9 @@ class Config:
 
         if cls.APP_ENV == "production" and cls.DEBUG:
             raise ValueError("Debug mode cannot be enabled in production")
+        
+        if len(cls.SENDER_WALLET_PRIVATE_KEY) != 88:
+            raise ValueError("Invalid private key length - must be 88 base58 characters")
 
 # Validate configuration on import
 Config.validate()
