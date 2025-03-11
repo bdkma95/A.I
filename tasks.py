@@ -1,4 +1,5 @@
 from celery import Celery
+from random import random
 import logging
 import time
 import threading
